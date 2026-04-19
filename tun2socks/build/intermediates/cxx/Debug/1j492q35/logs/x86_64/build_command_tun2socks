@@ -1,0 +1,4 @@
+/Users/huiliu/Library/Android/sdk/cmake/3.22.1/bin/ninja \
+  -C \
+  /Users/huiliu/www/android/VlessVPN/tun2socks/.cxx/Debug/1j492q35/x86_64 \
+  tun2socks
