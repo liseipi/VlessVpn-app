@@ -10,14 +10,32 @@ import android.util.Log;
 
 import androidx.annotation.Nullable;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.security.KeyStore;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
 
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -25,12 +43,6 @@ import okhttp3.Response;
 import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
 import okio.ByteString;
-
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
-import java.security.cert.X509Certificate;
-import java.util.concurrent.TimeUnit;
 
 /**
  * A foreground service that listens on localhost SOCKS5,
@@ -48,13 +60,14 @@ public class VlessProxyService extends Service {
     private static final String CHANNEL_ID = "vless_proxy";
     private static final int    NOTIF_ID   = 2;
 
-    private ServerSocket     serverSocket;
-    private ExecutorService  pool;
-    private VlessConfig      cfg;
-    private OkHttpClient     httpClient;
+    private ServerSocket    serverSocket;
+    private ExecutorService pool;
+    private VlessConfig     cfg;
+    private OkHttpClient    httpClient;
 
-    // Shared state for UI updates
     static volatile String lastStatus = "Stopped";
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -82,12 +95,25 @@ public class VlessProxyService extends Service {
         return START_STICKY;
     }
 
-    // ── Accept loop ────────────────────────────────────────────────────────
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        lastStatus = "Stopped";
+        if (pool != null) pool.shutdownNow();
+        try { if (serverSocket != null) serverSocket.close(); } catch (IOException ignored) {}
+        if (httpClient != null) httpClient.dispatcher().executorService().shutdown();
+    }
+
+    @Nullable
+    @Override
+    public IBinder onBind(Intent intent) { return null; }
+
+    // ── Accept loop ───────────────────────────────────────────────────────
 
     private void acceptLoop() {
         try {
             serverSocket = new ServerSocket(VlessConfig.SOCKS5_PORT, 50,
-                    java.net.InetAddress.getLoopbackAddress());
+                    InetAddress.getLoopbackAddress());
             Log.i(TAG, "SOCKS5 listening on :" + VlessConfig.SOCKS5_PORT);
 
             while (!serverSocket.isClosed()) {
@@ -95,7 +121,7 @@ public class VlessProxyService extends Service {
                 pool.execute(() -> handleSocks5(client));
             }
         } catch (IOException e) {
-            if (!serverSocket.isClosed()) {
+            if (serverSocket != null && !serverSocket.isClosed()) {
                 Log.e(TAG, "accept error: " + e.getMessage());
             }
         }
@@ -108,20 +134,20 @@ public class VlessProxyService extends Service {
             InputStream  in  = sock.getInputStream();
             OutputStream out = sock.getOutputStream();
 
-            // Auth negotiation
+            // Auth negotiation: VER(1) + NMETHODS(1)
             byte[] greet = readN(in, 2);
             if (greet == null || greet[0] != 0x05) { sock.close(); return; }
             int nmethods = greet[1] & 0xFF;
             readN(in, nmethods); // discard method list
-            out.write(new byte[]{0x05, 0x00}); // no auth
+            out.write(new byte[]{0x05, 0x00}); // no auth required
 
-            // Request
+            // Request: VER(1) + CMD(1) + RSV(1) + ATYP(1)
             byte[] req = readN(in, 4);
             if (req == null || req[0] != 0x05 || req[1] != 0x01) { sock.close(); return; }
 
             String host;
             int    port;
-            byte atyp = req[3];
+            byte   atyp = req[3];
 
             if (atyp == 0x01) {           // IPv4
                 byte[] ip = readN(in, 4);
@@ -137,12 +163,12 @@ public class VlessProxyService extends Service {
             } else if (atyp == 0x04) {    // IPv6
                 byte[] ip6 = readN(in, 16);
                 if (ip6 == null) { sock.close(); return; }
-                host = java.net.InetAddress.getByAddress(ip6).getHostAddress();
+                host = InetAddress.getByAddress(ip6).getHostAddress();
                 port = readUint16(in);
             } else { sock.close(); return; }
 
-            // Reply success
-            out.write(new byte[]{0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0});
+            // Reply success (BND.ADDR = 0.0.0.0, BND.PORT = 0)
+            out.write(new byte[]{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0});
 
             openTunnelAndRelay(sock, in, out, host, port);
 
@@ -156,23 +182,18 @@ public class VlessProxyService extends Service {
 
     private void openTunnelAndRelay(Socket sock, InputStream in, OutputStream out,
                                     String host, int port) {
-        String wsUrl = cfg.buildWsUrl();
-
         Request request = new Request.Builder()
-                .url(wsUrl)
+                .url(cfg.buildWsUrl())
                 .header("Host",          cfg.wsHost)
                 .header("User-Agent",    "Mozilla/5.0 (Linux; Android 13)")
                 .header("Cache-Control", "no-cache")
                 .header("Pragma",        "no-cache")
                 .build();
 
-        // Collect early data while WS is connecting
-        java.util.concurrent.LinkedBlockingQueue<byte[]> earlyData =
-                new java.util.concurrent.LinkedBlockingQueue<>();
-        java.util.concurrent.atomic.AtomicBoolean tunnelReady =
-                new java.util.concurrent.AtomicBoolean(false);
+        // Collect early data from the client socket while WS handshake is in progress
+        LinkedBlockingQueue<byte[]> earlyData = new LinkedBlockingQueue<>();
+        AtomicBoolean tunnelReady = new AtomicBoolean(false);
 
-        // Start reading early data in background
         pool.execute(() -> {
             byte[] buf = new byte[4096];
             try {
@@ -185,7 +206,7 @@ public class VlessProxyService extends Service {
 
         httpClient.newWebSocket(request, new WebSocketListener() {
 
-            // VLESS response skip state (mirrors relay() in client.js)
+            // VLESS response header skip state — mirrors relay() in client.js
             private byte[]  respBuf     = new byte[0];
             private boolean respSkipped = false;
             private int     respHdrSize = -1;
@@ -194,19 +215,21 @@ public class VlessProxyService extends Service {
             public void onOpen(WebSocket ws, Response response) {
                 tunnelReady.set(true);
 
-                // Build first packet: VLESS header + early data
+                // First packet = VLESS binary header + any buffered early data
                 byte[] vlessHdr = VlessHeader.build(cfg.uuid, host, port);
-                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
                 try {
                     baos.write(vlessHdr);
                     byte[] ed;
                     while ((ed = earlyData.poll()) != null) baos.write(ed);
                     ws.send(ByteString.of(baos.toByteArray()));
                 } catch (IOException e) {
-                    Log.e(TAG, "send vless hdr: " + e.getMessage());
+                    Log.e(TAG, "send vless hdr error: " + e.getMessage());
+                    ws.close(1000, null);
+                    return;
                 }
 
-                // Forward sock→ws
+                // Forward sock → ws (upstream relay)
                 pool.execute(() -> {
                     byte[] buf = new byte[4096];
                     try {
@@ -221,7 +244,9 @@ public class VlessProxyService extends Service {
 
             @Override
             public void onMessage(WebSocket ws, ByteString bytes) {
-                // Mirror relay() VLESS response header skip logic
+                // Downstream relay: ws → sock
+                // Skip VLESS response header first (mirrors relay() in client.js)
+                // Header format: version(1) + addon_len(1) + addon(addon_len bytes)
                 byte[] buf = bytes.toByteArray();
                 try {
                     if (respSkipped) {
@@ -229,12 +254,11 @@ public class VlessProxyService extends Service {
                         return;
                     }
 
-                    // Accumulate until we have at least 2 bytes
                     respBuf = concat(respBuf, buf);
                     if (respBuf.length < 2) return;
 
                     if (respHdrSize == -1) {
-                        // byte[0]=version, byte[1]=addon_len => total = 2 + addon_len
+                        // byte[0]=version, byte[1]=addon_len  →  total skip = 2 + addon_len
                         respHdrSize = 2 + (respBuf[1] & 0xFF);
                     }
                     if (respBuf.length < respHdrSize) return;
@@ -263,86 +287,100 @@ public class VlessProxyService extends Service {
         });
     }
 
-    // ── OkHttpClient with optional TLS skip + real SNI override ──────────
+    // ── OkHttpClient: trust-all TLS + real SNI injection ─────────────────
 
     private OkHttpClient buildOkHttpClient() {
         OkHttpClient.Builder builder = new OkHttpClient.Builder()
                 .connectTimeout(15, TimeUnit.SECONDS)
-                .readTimeout(0, TimeUnit.SECONDS)
+                .readTimeout(0,  TimeUnit.SECONDS)
                 .writeTimeout(0, TimeUnit.SECONDS);
 
         try {
-            // Build a trust manager — either trust-all or default
-            X509TrustManager trustManager;
-            SSLContext        sslContext;
+            final X509TrustManager trustManager;
+            final SSLContext       sslContext;
 
             if (!cfg.rejectUnauthorized) {
-                // Trust all certs (same as rejectUnauthorized:false in client.js)
+                // Trust all certificates (mirrors rejectUnauthorized:false in client.js)
                 trustManager = new X509TrustManager() {
-                    public void checkClientTrusted(X509Certificate[] c, String a) {}
-                    public void checkServerTrusted(X509Certificate[] c, String a) {}
-                    public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+                    @Override public void checkClientTrusted(X509Certificate[] c, String a) {}
+                    @Override public void checkServerTrusted(X509Certificate[] c, String a) {}
+                    @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
                 };
                 sslContext = SSLContext.getInstance("TLS");
-                sslContext.init(null, new TrustManager[]{trustManager}, new java.security.SecureRandom());
+                sslContext.init(null, new TrustManager[]{trustManager}, new SecureRandom());
                 builder.hostnameVerifier((hostname, session) -> true);
             } else {
-                // Use system default trust manager
-                javax.net.ssl.TrustManagerFactory tmf = javax.net.ssl.TrustManagerFactory
-                        .getInstance(javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
-                tmf.init((java.security.KeyStore) null);
+                // Use system default trust store
+                TrustManagerFactory tmf = TrustManagerFactory
+                        .getInstance(TrustManagerFactory.getDefaultAlgorithm());
+                tmf.init((KeyStore) null);
                 trustManager = (X509TrustManager) tmf.getTrustManagers()[0];
                 sslContext = SSLContext.getInstance("TLS");
                 sslContext.init(null, null, null);
             }
 
-            // Wrap SSLSocketFactory to inject SNI hostname (client.js uses `servername: CFG.sni`)
+            // Inject SNI via a custom SSLSocketFactory wrapper
+            // Mirrors `servername: CFG.sni` in client.js WebSocket options
             final String sniHost = (cfg.sni != null && !cfg.sni.isEmpty()) ? cfg.sni : cfg.server;
-            javax.net.ssl.SSLSocketFactory baseFactory = sslContext.getSocketFactory();
+            final SSLSocketFactory baseFactory = sslContext.getSocketFactory();
 
-            javax.net.ssl.SSLSocketFactory sniFactory = new javax.net.ssl.SSLSocketFactory() {
-                @Override public String[] getDefaultCipherSuites() { return baseFactory.getDefaultCipherSuites(); }
-                @Override public String[] getSupportedCipherSuites() { return baseFactory.getSupportedCipherSuites(); }
+            SSLSocketFactory sniFactory = new SSLSocketFactory() {
+                @Override
+                public String[] getDefaultCipherSuites() {
+                    return baseFactory.getDefaultCipherSuites();
+                }
 
-                private javax.net.ssl.SSLSocket setSnI(java.net.Socket s) {
-                    if (s instanceof javax.net.ssl.SSLSocket) {
-                        javax.net.ssl.SSLSocket ssl = (javax.net.ssl.SSLSocket) s;
+                @Override
+                public String[] getSupportedCipherSuites() {
+                    return baseFactory.getSupportedCipherSuites();
+                }
+
+                /** Inject SNI hostname into the socket before returning. */
+                private Socket withSni(Socket s) {
+                    if (s instanceof SSLSocket) {
+                        SSLSocket ssl = (SSLSocket) s;
                         try {
-                            // Set SNI via SSLParameters
-                            javax.net.ssl.SSLParameters params = ssl.getSSLParameters();
-                            params.setServerNames(java.util.Collections.singletonList(
-                                    new javax.net.ssl.SNIHostName(sniHost)));
+                            SSLParameters params = ssl.getSSLParameters();
+                            params.setServerNames(Collections.singletonList(new SNIHostName(sniHost)));
                             ssl.setSSLParameters(params);
                         } catch (Exception e) {
-                            Log.w(TAG, "SNI set failed: " + e.getMessage());
+                            Log.w(TAG, "SNI injection failed: " + e.getMessage());
                         }
                     }
-                    return (javax.net.ssl.SSLSocket) s;
+                    return s;
                 }
 
                 @Override
-                public java.net.Socket createSocket() throws IOException {
-                    return setSnI(baseFactory.createSocket());
+                public Socket createSocket() throws IOException {
+                    return withSni(baseFactory.createSocket());
                 }
+
                 @Override
-                public java.net.Socket createSocket(java.net.Socket s, String h, int p, boolean ac) throws IOException {
-                    return setSnI(baseFactory.createSocket(s, sniHost, p, ac));
+                public Socket createSocket(Socket s, String h, int p, boolean autoClose)
+                        throws IOException {
+                    return withSni(baseFactory.createSocket(s, sniHost, p, autoClose));
                 }
+
                 @Override
-                public java.net.Socket createSocket(String h, int p) throws IOException {
-                    return setSnI(baseFactory.createSocket(h, p));
+                public Socket createSocket(String h, int p) throws IOException {
+                    return withSni(baseFactory.createSocket(h, p));
                 }
+
                 @Override
-                public java.net.Socket createSocket(String h, int p, java.net.InetAddress la, int lp) throws IOException {
-                    return setSnI(baseFactory.createSocket(h, p, la, lp));
+                public Socket createSocket(String h, int p, InetAddress la, int lp)
+                        throws IOException {
+                    return withSni(baseFactory.createSocket(h, p, la, lp));
                 }
+
                 @Override
-                public java.net.Socket createSocket(java.net.InetAddress a, int p) throws IOException {
-                    return setSnI(baseFactory.createSocket(a, p));
+                public Socket createSocket(InetAddress a, int p) throws IOException {
+                    return withSni(baseFactory.createSocket(a, p));
                 }
+
                 @Override
-                public java.net.Socket createSocket(java.net.InetAddress a, int p, java.net.InetAddress la, int lp) throws IOException {
-                    return setSnI(baseFactory.createSocket(a, p, la, lp));
+                public Socket createSocket(InetAddress a, int p, InetAddress la, int lp)
+                        throws IOException {
+                    return withSni(baseFactory.createSocket(a, p, la, lp));
                 }
             };
 
@@ -355,23 +393,9 @@ public class VlessProxyService extends Service {
         return builder.build();
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────
+    // ── I/O helpers ───────────────────────────────────────────────────────
 
-    @Override
-    public void onDestroy() {
-        super.onDestroy();
-        lastStatus = "Stopped";
-        if (pool != null) pool.shutdownNow();
-        try { if (serverSocket != null) serverSocket.close(); } catch (IOException ignored) {}
-        if (httpClient != null) httpClient.dispatcher().executorService().shutdown();
-    }
-
-    @Nullable
-    @Override
-    public IBinder onBind(Intent intent) { return null; }
-
-    // ── Helpers ───────────────────────────────────────────────────────────
-
+    /** Read exactly n bytes, returning null on EOF. */
     private byte[] readN(InputStream in, int n) throws IOException {
         byte[] buf = new byte[n];
         int off = 0;
@@ -383,6 +407,7 @@ public class VlessProxyService extends Service {
         return buf;
     }
 
+    /** Read a big-endian unsigned 16-bit port number. */
     private int readUint16(InputStream in) throws IOException {
         int hi = in.read(), lo = in.read();
         if (hi < 0 || lo < 0) throw new IOException("EOF reading port");
@@ -395,6 +420,8 @@ public class VlessProxyService extends Service {
         System.arraycopy(b, 0, r, a.length, b.length);
         return r;
     }
+
+    // ── Notification ──────────────────────────────────────────────────────
 
     private Notification buildNotification(String text) {
         NotificationManager nm = getSystemService(NotificationManager.class);

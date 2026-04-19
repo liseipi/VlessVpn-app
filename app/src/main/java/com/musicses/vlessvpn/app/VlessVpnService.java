@@ -98,7 +98,11 @@ public class VlessVpnService extends VpnService {
         builder.setSession("VLESS VPN");
 
         // Exclude our own app from the VPN tunnel to avoid loop
-        builder.addDisallowedApplication(getPackageName());
+        try {
+            builder.addDisallowedApplication(getPackageName());
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            Log.w(TAG, "addDisallowedApplication failed: " + e.getMessage());
+        }
 
         vpnFd = builder.establish();
         if (vpnFd == null) throw new IOException("Failed to establish VPN interface");
