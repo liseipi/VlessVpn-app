@@ -158,17 +158,24 @@ public class VlessVpnService extends VpnService {
 
     /**
      * Polls TCP port until a connection succeeds or timeout expires.
-     * This guarantees tun2socks never tries to connect before the socket is bound.
+     * IMPORTANT: must call protect() on the probe socket because VpnService
+     * routes all unprotected sockets through the TUN — which doesn't exist yet,
+     * causing the probe to fail even when SOCKS5 is listening.
      */
     private boolean waitForSocks5(int timeoutSec) {
         long deadline = System.currentTimeMillis() + timeoutSec * 1000L;
         while (System.currentTimeMillis() < deadline) {
-            try (Socket s = new Socket()) {
-                s.connect(new InetSocketAddress("127.0.0.1", VlessConfig.SOCKS5_PORT), 200);
+            Socket s = new Socket();
+            try {
+                // protect() exempts this socket from VPN routing
+                protect(s);
+                s.connect(new InetSocketAddress("127.0.0.1", VlessConfig.SOCKS5_PORT), 300);
+                s.close();
                 return true;   // port is accepting connections
             } catch (IOException e) {
+                try { s.close(); } catch (IOException ignored) {}
                 // Not ready yet — wait a bit and retry
-                try { Thread.sleep(100); } catch (InterruptedException ie) { return false; }
+                try { Thread.sleep(150); } catch (InterruptedException ie) { return false; }
             }
         }
         return false;

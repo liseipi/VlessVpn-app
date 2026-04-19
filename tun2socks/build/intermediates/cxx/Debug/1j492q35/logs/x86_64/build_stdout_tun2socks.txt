@@ -1,2 +1,0 @@
-ninja: Entering directory `/Users/huiliu/www/android/VlessVPN/tun2socks/.cxx/Debug/1j492q35/x86_64'
-ninja: no work to do.
