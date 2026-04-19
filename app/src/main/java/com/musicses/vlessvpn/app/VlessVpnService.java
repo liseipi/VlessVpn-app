@@ -12,13 +12,18 @@ import android.util.Log;
 import com.musicses.vlessvpn.Tun2Socks;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.util.Collections;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Android VpnService that:
- *   1. Establishes a TUN interface (routes all traffic through it)
- *   2. Starts tun2socks pointing at the local SOCKS5 proxy (VlessProxyService)
- *   3. Starts VlessProxyService which runs the VLESS WS tunnel
+ *   1. Starts VlessProxyService (SOCKS5 server)
+ *   2. Waits until SOCKS5 port is actually accepting connections
+ *   3. Establishes TUN interface
+ *   4. Starts tun2socks routing TUN → SOCKS5
  */
 public class VlessVpnService extends VpnService {
     private static final String TAG       = "VlessVpnService";
@@ -37,6 +42,9 @@ public class VlessVpnService extends VpnService {
     private static final String TUN_ROUTE6    = "::";
     private static final String DNS_PRIMARY   = "8.8.8.8";
     private static final String DNS_SECONDARY = "1.1.1.1";
+
+    // Max seconds to wait for SOCKS5 to become ready
+    private static final int SOCKS5_READY_TIMEOUT_SEC = 10;
 
     private ParcelFileDescriptor vpnFd;
     private Thread               tun2socksThread;
@@ -59,12 +67,17 @@ public class VlessVpnService extends VpnService {
 
         startForeground(NOTIF_ID, buildNotification("VPN connecting…"));
 
-        try {
-            startVpn();
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to start VPN: " + e.getMessage());
-            stopSelf();
-        }
+        // Run startup in background — don't block onStartCommand
+        new Thread(() -> {
+            try {
+                startVpn();
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to start VPN: " + e.getMessage());
+                VpnStateHolder.setState(VpnStateHolder.State.DISCONNECTED);
+                stopSelf();
+            }
+        }, "vpn-startup").start();
+
         return START_STICKY;
     }
 
@@ -74,19 +87,26 @@ public class VlessVpnService extends VpnService {
         stopVpn();
     }
 
-    // ── Start / Stop ──────────────────────────────────────────────────────
+    // ── Start ─────────────────────────────────────────────────────────────
 
     private void startVpn() throws IOException {
-        // 1. Initialize native library
+        // 1. Initialize native library (idempotent guard is inside Tun2Socks)
         Tun2Socks.initialize(getApplicationContext());
 
-        // 2. Start VLESS SOCKS5 proxy service first
+        // 2. Start VLESS SOCKS5 proxy service
         Intent proxyIntent = new Intent(this, VlessProxyService.class);
         proxyIntent.setAction(VlessProxyService.ACTION_START);
         proxyIntent.putExtra(VlessProxyService.EXTRA_CONFIG, configJson);
         startForegroundService(proxyIntent);
 
-        // 3. Build TUN interface
+        // 3. Wait until SOCKS5 is actually listening (poll with TCP probe)
+        Log.i(TAG, "Waiting for SOCKS5 proxy on :" + VlessConfig.SOCKS5_PORT);
+        if (!waitForSocks5(SOCKS5_READY_TIMEOUT_SEC)) {
+            throw new IOException("SOCKS5 proxy did not become ready in time");
+        }
+        Log.i(TAG, "SOCKS5 proxy is ready");
+
+        // 4. Build TUN interface
         Builder builder = new Builder();
         builder.setMtu(MTU);
         builder.addAddress(TUN_IP4, 24);
@@ -107,55 +127,65 @@ public class VlessVpnService extends VpnService {
         vpnFd = builder.establish();
         if (vpnFd == null) throw new IOException("Failed to establish VPN interface");
 
-        // 4. Start tun2socks in background thread
-        // Wait briefly for SOCKS5 proxy to be ready
+        // 5. Start tun2socks — blocks until stopped
         final ParcelFileDescriptor fd = vpnFd;
         tun2socksThread = new Thread(() -> {
-            try { Thread.sleep(600); } catch (InterruptedException e) { return; }
-
-            // Mark connected only after tun2socks actually starts
+            // Mark connected now that everything is truly ready
             updateNotification("VPN connected → " + getServerName());
             VpnStateHolder.setState(VpnStateHolder.State.CONNECTED);
 
             Log.i(TAG, "Starting tun2socks → SOCKS5 127.0.0.1:" + VlessConfig.SOCKS5_PORT);
-            // API: startTun2Socks(logLevel, vpnFd, mtu,
-            //                    socksAddr, socksPort,
-            //                    netIPv4, netIPv6, netmask,
-            //                    forwardUdp, extraArgs)
             boolean ok = Tun2Socks.startTun2Socks(
                     Tun2Socks.LogLevel.WARNING,
                     fd,
                     MTU,
-                    "127.0.0.1",                         // SOCKS5 server address
-                    VlessConfig.SOCKS5_PORT,             // SOCKS5 port
-                    "10.0.0.1",                          // TUN gateway IPv4
-                    null,                                // IPv6 (optional)
+                    "127.0.0.1",               // SOCKS5 server address
+                    VlessConfig.SOCKS5_PORT,   // SOCKS5 port
+                    "10.0.0.1",                // TUN gateway IPv4
+                    null,                      // IPv6 (optional)
                     TUN_NETMASK,
-                    false,                               // forwardUdp (TCP only for VLESS)
+                    false,                     // forwardUdp — VLESS is TCP only
                     Collections.emptyList()
             );
             Log.i(TAG, "tun2socks exited, ok=" + ok);
-            // tun2socks exited unexpectedly — update state
             VpnStateHolder.setState(VpnStateHolder.State.DISCONNECTED);
         }, "tun2socks-thread");
         tun2socksThread.setDaemon(true);
         tun2socksThread.start();
     }
 
+    // ── Wait for SOCKS5 ready ─────────────────────────────────────────────
+
+    /**
+     * Polls TCP port until a connection succeeds or timeout expires.
+     * This guarantees tun2socks never tries to connect before the socket is bound.
+     */
+    private boolean waitForSocks5(int timeoutSec) {
+        long deadline = System.currentTimeMillis() + timeoutSec * 1000L;
+        while (System.currentTimeMillis() < deadline) {
+            try (Socket s = new Socket()) {
+                s.connect(new InetSocketAddress("127.0.0.1", VlessConfig.SOCKS5_PORT), 200);
+                return true;   // port is accepting connections
+            } catch (IOException e) {
+                // Not ready yet — wait a bit and retry
+                try { Thread.sleep(100); } catch (InterruptedException ie) { return false; }
+            }
+        }
+        return false;
+    }
+
+    // ── Stop ──────────────────────────────────────────────────────────────
+
     private void stopVpn() {
-        // Stop tun2socks native loop
         try { Tun2Socks.stopTun2Socks(); } catch (Exception ignored) {}
         if (tun2socksThread != null) {
             tun2socksThread.interrupt();
             tun2socksThread = null;
         }
-
-        // Close TUN fd
         if (vpnFd != null) {
             try { vpnFd.close(); } catch (IOException ignored) {}
             vpnFd = null;
         }
-
         // Stop proxy service
         Intent proxyStop = new Intent(this, VlessProxyService.class);
         proxyStop.setAction(VlessProxyService.ACTION_STOP);
@@ -197,10 +227,4 @@ public class VlessVpnService extends VpnService {
         VlessConfig cfg = ConfigStore.fromJson(configJson);
         return cfg != null ? cfg.server : "unknown";
     }
-
-    // ── Tun2Socks shim — reorder params to match Tun2Socks.java API ──────
-    // The library's API is:
-    //   startTun2Socks(logLevel, vpnFd, mtu, netIPv4, netIPv6, netmask,
-    //                  socksAddr, socksPort, forwardUdp, extraArgs)
-    // We call it correctly above.
 }

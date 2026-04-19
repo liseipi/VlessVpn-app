@@ -112,8 +112,10 @@ public class VlessProxyService extends Service {
 
     private void acceptLoop() {
         try {
-            serverSocket = new ServerSocket(VlessConfig.SOCKS5_PORT, 50,
-                    InetAddress.getLoopbackAddress());
+            serverSocket = new ServerSocket();
+            serverSocket.setReuseAddress(true);   // allow quick restart without "Address already in use"
+            serverSocket.bind(new java.net.InetSocketAddress(
+                    InetAddress.getLoopbackAddress(), VlessConfig.SOCKS5_PORT));
             Log.i(TAG, "SOCKS5 listening on :" + VlessConfig.SOCKS5_PORT);
 
             while (!serverSocket.isClosed()) {

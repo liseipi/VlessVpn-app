@@ -12,6 +12,8 @@ set_target_properties(tun2socks_prebuilt PROPERTIES
 # Build the JNI wrapper
 add_library(tun2socks SHARED tun2socks.cpp)
 
+target_link_options(tun2socks PRIVATE "-Wl,-z,max-page-size=16384")
+
 target_link_libraries(tun2socks
         tun2socks_prebuilt
         android
