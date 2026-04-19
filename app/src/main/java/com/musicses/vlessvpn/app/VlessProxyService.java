@@ -10,7 +10,6 @@ import android.util.Log;
 
 import androidx.annotation.Nullable;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -24,9 +23,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLContext;
@@ -48,8 +45,11 @@ import okio.ByteString;
  * A foreground service that listens on localhost SOCKS5,
  * and tunnels each connection through VLESS-over-WebSocket.
  *
- * Logic mirrors client.js:
- *   handleSocks5() → openTunnel() → buildVlessHeader() → relay()
+ * FIXES applied:
+ *   1. 删除"早期数据收集"线程 —— 原实现中两个线程同时读同一个 InputStream，
+ *      造成数据被抢占/乱序。改为在 onOpen 里先发 VLESS 头，再单独启动上游 relay。
+ *   2. onMessage 里 out.write() 后加 out.flush()，避免数据滞留缓冲区。
+ *   3. 使用 VlessHeader（已修复，不再做 DNS 解析）构建头部。
  */
 public class VlessProxyService extends Service {
     private static final String TAG = "VlessProxy";
@@ -113,10 +113,13 @@ public class VlessProxyService extends Service {
     private void acceptLoop() {
         try {
             serverSocket = new ServerSocket();
-            serverSocket.setReuseAddress(true);   // allow quick restart without "Address already in use"
+            serverSocket.setReuseAddress(true);
             serverSocket.bind(new java.net.InetSocketAddress(
                     InetAddress.getLoopbackAddress(), VlessConfig.SOCKS5_PORT));
             Log.i(TAG, "SOCKS5 listening on :" + VlessConfig.SOCKS5_PORT);
+
+            // FIX: 通知 VlessVpnService 代理已就绪，替代 TCP 探测方案
+            VlessVpnService.proxyReady = true;
 
             while (!serverSocket.isClosed()) {
                 Socket client = serverSocket.accept();
@@ -129,7 +132,7 @@ public class VlessProxyService extends Service {
         }
     }
 
-    // ── SOCKS5 handshake (mirrors handleSocks5 in client.js) ──────────────
+    // ── SOCKS5 handshake ──────────────────────────────────────────────────
 
     private void handleSocks5(Socket sock) {
         try {
@@ -140,8 +143,8 @@ public class VlessProxyService extends Service {
             byte[] greet = readN(in, 2);
             if (greet == null || greet[0] != 0x05) { sock.close(); return; }
             int nmethods = greet[1] & 0xFF;
-            readN(in, nmethods); // discard method list
-            out.write(new byte[]{0x05, 0x00}); // no auth required
+            readN(in, nmethods);
+            out.write(new byte[]{0x05, 0x00}); // no auth
 
             // Request: VER(1) + CMD(1) + RSV(1) + ATYP(1)
             byte[] req = readN(in, 4);
@@ -169,7 +172,7 @@ public class VlessProxyService extends Service {
                 port = readUint16(in);
             } else { sock.close(); return; }
 
-            // Reply success (BND.ADDR = 0.0.0.0, BND.PORT = 0)
+            // Reply: success
             out.write(new byte[]{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0});
 
             openTunnelAndRelay(sock, in, out, host, port);
@@ -180,8 +183,19 @@ public class VlessProxyService extends Service {
         }
     }
 
-    // ── Open VLESS WS tunnel and relay (mirrors openTunnel + relay) ───────
+    // ── Open VLESS WS tunnel and relay ────────────────────────────────────
 
+    /**
+     * FIX: 删除了原来的"早期数据收集"辅助线程。
+     *
+     * 原实现用一个额外线程在 WS 握手期间收集 early data，但这会导致
+     * 两个线程（early data 线程 + onOpen 里的 relay 线程）同时读同一个
+     * InputStream，造成数据被抢占、乱序、丢包。
+     *
+     * 正确做法：在 onOpen 里先发纯 VLESS 头（不含 payload），然后启动
+     * 单一的上游 relay 线程独占读取 InputStream。
+     * VLESS 协议允许头和数据分开发送，服务端会等待后续数据帧。
+     */
     private void openTunnelAndRelay(Socket sock, InputStream in, OutputStream out,
                                     String host, int port) {
         Request request = new Request.Builder()
@@ -192,46 +206,20 @@ public class VlessProxyService extends Service {
                 .header("Pragma",        "no-cache")
                 .build();
 
-        // Collect early data from the client socket while WS handshake is in progress
-        LinkedBlockingQueue<byte[]> earlyData = new LinkedBlockingQueue<>();
-        AtomicBoolean tunnelReady = new AtomicBoolean(false);
-
-        pool.execute(() -> {
-            byte[] buf = new byte[4096];
-            try {
-                int n;
-                while (!tunnelReady.get() && (n = in.read(buf)) > 0) {
-                    earlyData.add(Arrays.copyOf(buf, n));
-                }
-            } catch (IOException ignored) {}
-        });
-
         httpClient.newWebSocket(request, new WebSocketListener() {
 
-            // VLESS response header skip state — mirrors relay() in client.js
+            // VLESS 响应头跳过状态
             private byte[]  respBuf     = new byte[0];
             private boolean respSkipped = false;
             private int     respHdrSize = -1;
 
             @Override
             public void onOpen(WebSocket ws, Response response) {
-                tunnelReady.set(true);
-
-                // First packet = VLESS binary header + any buffered early data
+                // 第一帧：仅发 VLESS 二进制头（不混入 payload，避免竞争）
                 byte[] vlessHdr = VlessHeader.build(cfg.uuid, host, port);
-                ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                try {
-                    baos.write(vlessHdr);
-                    byte[] ed;
-                    while ((ed = earlyData.poll()) != null) baos.write(ed);
-                    ws.send(ByteString.of(baos.toByteArray()));
-                } catch (IOException e) {
-                    Log.e(TAG, "send vless hdr error: " + e.getMessage());
-                    ws.close(1000, null);
-                    return;
-                }
+                ws.send(ByteString.of(vlessHdr));
 
-                // Forward sock → ws (upstream relay)
+                // 上游 relay：sock → ws，单线程独占读取 InputStream
                 pool.execute(() -> {
                     byte[] buf = new byte[4096];
                     try {
@@ -246,13 +234,13 @@ public class VlessProxyService extends Service {
 
             @Override
             public void onMessage(WebSocket ws, ByteString bytes) {
-                // Downstream relay: ws → sock
-                // Skip VLESS response header first (mirrors relay() in client.js)
-                // Header format: version(1) + addon_len(1) + addon(addon_len bytes)
+                // 下游 relay：ws → sock
+                // 先跳过 VLESS 响应头（version(1) + addon_len(1) + addon(addon_len)）
                 byte[] buf = bytes.toByteArray();
                 try {
                     if (respSkipped) {
                         out.write(buf);
+                        out.flush(); // FIX: 确保数据立即写出，不滞留缓冲区
                         return;
                     }
 
@@ -260,7 +248,7 @@ public class VlessProxyService extends Service {
                     if (respBuf.length < 2) return;
 
                     if (respHdrSize == -1) {
-                        // byte[0]=version, byte[1]=addon_len  →  total skip = 2 + addon_len
+                        // byte[0]=version, byte[1]=addon_len => total skip = 2 + addon_len
                         respHdrSize = 2 + (respBuf[1] & 0xFF);
                     }
                     if (respBuf.length < respHdrSize) return;
@@ -268,7 +256,10 @@ public class VlessProxyService extends Service {
                     respSkipped = true;
                     byte[] payload = Arrays.copyOfRange(respBuf, respHdrSize, respBuf.length);
                     respBuf = new byte[0];
-                    if (payload.length > 0) out.write(payload);
+                    if (payload.length > 0) {
+                        out.write(payload);
+                        out.flush(); // FIX: 同上
+                    }
 
                 } catch (IOException e) {
                     ws.close(1000, null);
@@ -289,7 +280,7 @@ public class VlessProxyService extends Service {
         });
     }
 
-    // ── OkHttpClient: trust-all TLS + real SNI injection ─────────────────
+    // ── OkHttpClient: trust-all TLS + SNI injection ───────────────────────
 
     private OkHttpClient buildOkHttpClient() {
         OkHttpClient.Builder builder = new OkHttpClient.Builder()
@@ -302,7 +293,6 @@ public class VlessProxyService extends Service {
             final SSLContext       sslContext;
 
             if (!cfg.rejectUnauthorized) {
-                // Trust all certificates (mirrors rejectUnauthorized:false in client.js)
                 trustManager = new X509TrustManager() {
                     @Override public void checkClientTrusted(X509Certificate[] c, String a) {}
                     @Override public void checkServerTrusted(X509Certificate[] c, String a) {}
@@ -312,7 +302,6 @@ public class VlessProxyService extends Service {
                 sslContext.init(null, new TrustManager[]{trustManager}, new SecureRandom());
                 builder.hostnameVerifier((hostname, session) -> true);
             } else {
-                // Use system default trust store
                 TrustManagerFactory tmf = TrustManagerFactory
                         .getInstance(TrustManagerFactory.getDefaultAlgorithm());
                 tmf.init((KeyStore) null);
@@ -321,8 +310,6 @@ public class VlessProxyService extends Service {
                 sslContext.init(null, null, null);
             }
 
-            // Inject SNI via a custom SSLSocketFactory wrapper
-            // Mirrors `servername: CFG.sni` in client.js WebSocket options
             final String sniHost = (cfg.sni != null && !cfg.sni.isEmpty()) ? cfg.sni : cfg.server;
             final SSLSocketFactory baseFactory = sslContext.getSocketFactory();
 
@@ -337,7 +324,6 @@ public class VlessProxyService extends Service {
                     return baseFactory.getSupportedCipherSuites();
                 }
 
-                /** Inject SNI hostname into the socket before returning. */
                 private Socket withSni(Socket s) {
                     if (s instanceof SSLSocket) {
                         SSLSocket ssl = (SSLSocket) s;
@@ -397,7 +383,6 @@ public class VlessProxyService extends Service {
 
     // ── I/O helpers ───────────────────────────────────────────────────────
 
-    /** Read exactly n bytes, returning null on EOF. */
     private byte[] readN(InputStream in, int n) throws IOException {
         byte[] buf = new byte[n];
         int off = 0;
@@ -409,7 +394,6 @@ public class VlessProxyService extends Service {
         return buf;
     }
 
-    /** Read a big-endian unsigned 16-bit port number. */
     private int readUint16(InputStream in) throws IOException {
         int hi = in.read(), lo = in.read();
         if (hi < 0 || lo < 0) throw new IOException("EOF reading port");

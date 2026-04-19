@@ -12,18 +12,21 @@ import android.util.Log;
 import com.musicses.vlessvpn.Tun2Socks;
 
 import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.util.Collections;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
 /**
- * Android VpnService that:
- *   1. Starts VlessProxyService (SOCKS5 server)
- *   2. Waits until SOCKS5 port is actually accepting connections
- *   3. Establishes TUN interface
- *   4. Starts tun2socks routing TUN → SOCKS5
+ * Android VpnService.
+ *
+ * FIX: 删除了 waitForSocks5() TCP 探测机制。
+ *
+ * 原来用一个 TCP connect 探测 SOCKS5 是否就绪，但：
+ *  1. protect(s) 对 loopback 地址在 VPN 未建立时行为异常
+ *  2. 日志显示 AppsFilter 将 tun2socks 库模块(uid=10214) 与主 app(uid=10213)
+ *     判定为不同应用，跨进程 loopback 访问被 BLOCKED，导致探测永远失败
+ *
+ * 修复方案：
+ *  - VlessProxyService 就绪后通过静态 volatile 标志通知，主服务轮询该标志
+ *  - 完全绕开 TCP 探测，不再需要 protect()
  */
 public class VlessVpnService extends VpnService {
     private static final String TAG       = "VlessVpnService";
@@ -43,8 +46,8 @@ public class VlessVpnService extends VpnService {
     private static final String DNS_PRIMARY   = "8.8.8.8";
     private static final String DNS_SECONDARY = "1.1.1.1";
 
-    // Max seconds to wait for SOCKS5 to become ready
-    private static final int SOCKS5_READY_TIMEOUT_SEC = 10;
+    /** VlessProxyService 就绪后设为 true，停止后重置为 false */
+    static volatile boolean proxyReady = false;
 
     private ParcelFileDescriptor vpnFd;
     private Thread               tun2socksThread;
@@ -67,7 +70,6 @@ public class VlessVpnService extends VpnService {
 
         startForeground(NOTIF_ID, buildNotification("VPN connecting…"));
 
-        // Run startup in background — don't block onStartCommand
         new Thread(() -> {
             try {
                 startVpn();
@@ -90,34 +92,37 @@ public class VlessVpnService extends VpnService {
     // ── Start ─────────────────────────────────────────────────────────────
 
     private void startVpn() throws IOException {
-        // 1. Initialize native library (idempotent guard is inside Tun2Socks)
+        // 1. 初始化 native 库
         Tun2Socks.initialize(getApplicationContext());
 
-        // 2. Start VLESS SOCKS5 proxy service
+        // 2. 重置就绪标志
+        proxyReady = false;
+
+        // 3. 启动 VLESS SOCKS5 代理服务
         Intent proxyIntent = new Intent(this, VlessProxyService.class);
         proxyIntent.setAction(VlessProxyService.ACTION_START);
         proxyIntent.putExtra(VlessProxyService.EXTRA_CONFIG, configJson);
         startForegroundService(proxyIntent);
 
-        // 3. Wait until SOCKS5 is actually listening (poll with TCP probe)
-        Log.i(TAG, "Waiting for SOCKS5 proxy on :" + VlessConfig.SOCKS5_PORT);
-        if (!waitForSocks5(SOCKS5_READY_TIMEOUT_SEC)) {
+        // 4. 等待代理就绪（轮询 proxyReady 标志，由 VlessProxyService 设置）
+        //    FIX: 不再使用 TCP 探测（会被 AppsFilter BLOCKED），改为内存标志
+        Log.i(TAG, "Waiting for SOCKS5 proxy to become ready...");
+        if (!waitForProxyReady(10_000)) {
             throw new IOException("SOCKS5 proxy did not become ready in time");
         }
         Log.i(TAG, "SOCKS5 proxy is ready");
 
-        // 4. Build TUN interface
+        // 5. 建立 TUN 接口
         Builder builder = new Builder();
         builder.setMtu(MTU);
         builder.addAddress(TUN_IP4, 24);
         builder.addAddress(TUN_IP6, 64);
-        builder.addRoute(TUN_ROUTE4, 0);       // route all IPv4
-        builder.addRoute(TUN_ROUTE6, 0);       // route all IPv6
+        builder.addRoute(TUN_ROUTE4, 0);
+        builder.addRoute(TUN_ROUTE6, 0);
         builder.addDnsServer(DNS_PRIMARY);
         builder.addDnsServer(DNS_SECONDARY);
         builder.setSession("VLESS VPN");
 
-        // Exclude our own app from the VPN tunnel to avoid loop
         try {
             builder.addDisallowedApplication(getPackageName());
         } catch (android.content.pm.PackageManager.NameNotFoundException e) {
@@ -127,10 +132,9 @@ public class VlessVpnService extends VpnService {
         vpnFd = builder.establish();
         if (vpnFd == null) throw new IOException("Failed to establish VPN interface");
 
-        // 5. Start tun2socks — blocks until stopped
+        // 6. 启动 tun2socks
         final ParcelFileDescriptor fd = vpnFd;
         tun2socksThread = new Thread(() -> {
-            // Mark connected now that everything is truly ready
             updateNotification("VPN connected → " + getServerName());
             VpnStateHolder.setState(VpnStateHolder.State.CONNECTED);
 
@@ -139,12 +143,12 @@ public class VlessVpnService extends VpnService {
                     Tun2Socks.LogLevel.WARNING,
                     fd,
                     MTU,
-                    "127.0.0.1",               // SOCKS5 server address
-                    VlessConfig.SOCKS5_PORT,   // SOCKS5 port
-                    "10.0.0.1",                // TUN gateway IPv4
-                    null,                      // IPv6 (optional)
+                    "127.0.0.1",
+                    VlessConfig.SOCKS5_PORT,
+                    "10.0.0.1",
+                    null,
                     TUN_NETMASK,
-                    false,                     // forwardUdp — VLESS is TCP only
+                    false,
                     Collections.emptyList()
             );
             Log.i(TAG, "tun2socks exited, ok=" + ok);
@@ -154,36 +158,33 @@ public class VlessVpnService extends VpnService {
         tun2socksThread.start();
     }
 
-    // ── Wait for SOCKS5 ready ─────────────────────────────────────────────
+    // ── 等待代理就绪（轮询内存标志）────────────────────────────────────────
 
     /**
-     * Polls TCP port until a connection succeeds or timeout expires.
-     * IMPORTANT: must call protect() on the probe socket because VpnService
-     * routes all unprotected sockets through the TUN — which doesn't exist yet,
-     * causing the probe to fail even when SOCKS5 is listening.
+     * FIX: 替换原来的 TCP 探测。
+     *
+     * VlessProxyService 的 acceptLoop 在 ServerSocket.bind() 成功后
+     * 会将 VlessVpnService.proxyReady 设为 true。
+     * 这里每 100ms 轮询一次，最多等待 timeoutMs 毫秒。
      */
-    private boolean waitForSocks5(int timeoutSec) {
-        long deadline = System.currentTimeMillis() + timeoutSec * 1000L;
+    private boolean waitForProxyReady(long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
         while (System.currentTimeMillis() < deadline) {
-            Socket s = new Socket();
+            if (proxyReady) return true;
             try {
-                // protect() exempts this socket from VPN routing
-                protect(s);
-                s.connect(new InetSocketAddress("127.0.0.1", VlessConfig.SOCKS5_PORT), 300);
-                s.close();
-                return true;   // port is accepting connections
-            } catch (IOException e) {
-                try { s.close(); } catch (IOException ignored) {}
-                // Not ready yet — wait a bit and retry
-                try { Thread.sleep(150); } catch (InterruptedException ie) { return false; }
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
             }
         }
-        return false;
+        return proxyReady; // 最后再检查一次
     }
 
     // ── Stop ──────────────────────────────────────────────────────────────
 
     private void stopVpn() {
+        proxyReady = false;
         try { Tun2Socks.stopTun2Socks(); } catch (Exception ignored) {}
         if (tun2socksThread != null) {
             tun2socksThread.interrupt();
@@ -193,7 +194,6 @@ public class VlessVpnService extends VpnService {
             try { vpnFd.close(); } catch (IOException ignored) {}
             vpnFd = null;
         }
-        // Stop proxy service
         Intent proxyStop = new Intent(this, VlessProxyService.class);
         proxyStop.setAction(VlessProxyService.ACTION_STOP);
         startService(proxyStop);
@@ -226,8 +226,7 @@ public class VlessVpnService extends VpnService {
     }
 
     private void updateNotification(String text) {
-        NotificationManager nm = getSystemService(NotificationManager.class);
-        nm.notify(NOTIF_ID, buildNotification(text));
+        getSystemService(NotificationManager.class).notify(NOTIF_ID, buildNotification(text));
     }
 
     private String getServerName() {
