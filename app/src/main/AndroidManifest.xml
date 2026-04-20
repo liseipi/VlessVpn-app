@@ -39,13 +39,27 @@
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
+            <!--
+                FIX: Android 14+ 要求 foregroundServiceType="specialUse" 的 Service
+                必须声明此 property，否则启动时抛 SecurityException。
+            -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="vpn" />
         </service>
 
         <!-- VLESS SOCKS5 proxy service (runs the WebSocket tunnel) -->
         <service
             android:name=".VlessProxyService"
             android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:foregroundServiceType="specialUse">
+            <!--
+                FIX: Android 14+ 同上，必须声明 specialUse subtype property。
+            -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="vpn_proxy" />
+        </service>
 
     </application>
 

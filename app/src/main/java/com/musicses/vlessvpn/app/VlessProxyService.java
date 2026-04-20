@@ -25,6 +25,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
+import javax.net.SocketFactory;
 import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
@@ -50,6 +51,11 @@ import okio.ByteString;
  *      造成数据被抢占/乱序。改为在 onOpen 里先发 VLESS 头，再单独启动上游 relay。
  *   2. onMessage 里 out.write() 后加 out.flush()，避免数据滞留缓冲区。
  *   3. 使用 VlessHeader（已修复，不再做 DNS 解析）构建头部。
+ *   4. [核心修复] buildOkHttpClient() 注入自定义 SocketFactory，在每个 socket
+ *      connect() 之前调用 VlessVpnService.protectSocket()，将出站连接绑定到物理
+ *      网卡，彻底解决"代理自循环"（proxy loop）问题。
+ *      addDisallowedApplication 在 Android 12+ 某些设备/模拟器上对 loopback 行为
+ *      不稳定，逐 socket protect() 是官方推荐的正确做法。
  */
 public class VlessProxyService extends Service {
     private static final String TAG = "VlessProxy";
@@ -118,7 +124,7 @@ public class VlessProxyService extends Service {
                     InetAddress.getLoopbackAddress(), VlessConfig.SOCKS5_PORT));
             Log.i(TAG, "SOCKS5 listening on :" + VlessConfig.SOCKS5_PORT);
 
-            // FIX: 通知 VlessVpnService 代理已就绪，替代 TCP 探测方案
+            // 通知 VlessVpnService 代理已就绪，替代 TCP 探测方案
             VlessVpnService.proxyReady = true;
 
             while (!serverSocket.isClosed()) {
@@ -186,7 +192,7 @@ public class VlessProxyService extends Service {
     // ── Open VLESS WS tunnel and relay ────────────────────────────────────
 
     /**
-     * FIX: 删除了原来的"早期数据收集"辅助线程。
+     * 删除了原来的"早期数据收集"辅助线程。
      *
      * 原实现用一个额外线程在 WS 握手期间收集 early data，但这会导致
      * 两个线程（early data 线程 + onOpen 里的 relay 线程）同时读同一个
@@ -240,7 +246,7 @@ public class VlessProxyService extends Service {
                 try {
                     if (respSkipped) {
                         out.write(buf);
-                        out.flush(); // FIX: 确保数据立即写出，不滞留缓冲区
+                        out.flush(); // 确保数据立即写出，不滞留缓冲区
                         return;
                     }
 
@@ -258,7 +264,7 @@ public class VlessProxyService extends Service {
                     respBuf = new byte[0];
                     if (payload.length > 0) {
                         out.write(payload);
-                        out.flush(); // FIX: 同上
+                        out.flush();
                     }
 
                 } catch (IOException e) {
@@ -280,13 +286,62 @@ public class VlessProxyService extends Service {
         });
     }
 
-    // ── OkHttpClient: trust-all TLS + SNI injection ───────────────────────
+    // ── OkHttpClient: protect() + trust-all TLS + SNI injection ──────────
 
+    /**
+     * 构建 OkHttpClient。
+     *
+     * 核心修复：通过自定义 SocketFactory 在每个 socket 被 connect() 之前调用
+     * VlessVpnService.protectSocket()，将 socket 绑定到物理网卡，防止出站的
+     * WebSocket 连接被 TUN 接口拦截形成代理自循环（proxy loop）。
+     *
+     * OkHttp 调用自定义 SocketFactory.createSocket() 创建未连接的 socket，
+     * 然后再调用 socket.connect()。我们在 createSocket() 时立即 protect()，
+     * 时机正确，对 TLS 连接同样有效（SSLSocketFactory 会包装该 socket）。
+     */
     private OkHttpClient buildOkHttpClient() {
         OkHttpClient.Builder builder = new OkHttpClient.Builder()
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(0,  TimeUnit.SECONDS)
                 .writeTimeout(0, TimeUnit.SECONDS);
+
+        // ★ 核心修复：注入 protect()，防止出站 socket 被 TUN 拦截
+        builder.socketFactory(new SocketFactory() {
+            private final SocketFactory def = SocketFactory.getDefault();
+
+            /** protect 后返回 socket，若失败只记录警告不中断连接 */
+            private Socket p(Socket s) {
+                VlessVpnService.protectSocket(s);
+                return s;
+            }
+
+            @Override
+            public Socket createSocket() throws IOException {
+                return p(def.createSocket());
+            }
+
+            @Override
+            public Socket createSocket(String host, int port) throws IOException {
+                return p(def.createSocket(host, port));
+            }
+
+            @Override
+            public Socket createSocket(String host, int port,
+                                       InetAddress localAddr, int localPort) throws IOException {
+                return p(def.createSocket(host, port, localAddr, localPort));
+            }
+
+            @Override
+            public Socket createSocket(InetAddress addr, int port) throws IOException {
+                return p(def.createSocket(addr, port));
+            }
+
+            @Override
+            public Socket createSocket(InetAddress addr, int port,
+                                       InetAddress localAddr, int localPort) throws IOException {
+                return p(def.createSocket(addr, port, localAddr, localPort));
+            }
+        });
 
         try {
             final X509TrustManager trustManager;

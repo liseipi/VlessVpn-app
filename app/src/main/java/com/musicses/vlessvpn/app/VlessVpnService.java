@@ -17,16 +17,18 @@ import java.util.Collections;
 /**
  * Android VpnService.
  *
- * FIX: 删除了 waitForSocks5() TCP 探测机制。
+ * FIX 1: 删除了 waitForSocks5() TCP 探测机制。
+ *   原来用一个 TCP connect 探测 SOCKS5 是否就绪，但：
+ *    1. protect(s) 对 loopback 地址在 VPN 未建立时行为异常
+ *    2. 日志显示 AppsFilter 将 tun2socks 库模块(uid=10214) 与主 app(uid=10213)
+ *       判定为不同应用，跨进程 loopback 访问被 BLOCKED，导致探测永远失败
+ *   修复方案：VlessProxyService 就绪后通过静态 volatile 标志通知，主服务轮询该标志
  *
- * 原来用一个 TCP connect 探测 SOCKS5 是否就绪，但：
- *  1. protect(s) 对 loopback 地址在 VPN 未建立时行为异常
- *  2. 日志显示 AppsFilter 将 tun2socks 库模块(uid=10214) 与主 app(uid=10213)
- *     判定为不同应用，跨进程 loopback 访问被 BLOCKED，导致探测永远失败
- *
- * 修复方案：
- *  - VlessProxyService 就绪后通过静态 volatile 标志通知，主服务轮询该标志
- *  - 完全绕开 TCP 探测，不再需要 protect()
+ * FIX 2: 添加 instance 单例 + protectSocket() 静态方法。
+ *   VlessProxyService 的 OkHttp 出站 socket 必须通过 VpnService.protect() 排除在
+ *   TUN 路由之外，否则 WebSocket 连接到远端服务器时会被 TUN 再次拦截形成死循环。
+ *   addDisallowedApplication 在 Android 12+ 部分设备/模拟器上对 loopback 行为不稳定，
+ *   叠加 protect() 逐 socket 排除是最保险的官方推荐做法。
  */
 public class VlessVpnService extends VpnService {
     private static final String TAG       = "VlessVpnService";
@@ -49,11 +51,23 @@ public class VlessVpnService extends VpnService {
     /** VlessProxyService 就绪后设为 true，停止后重置为 false */
     static volatile boolean proxyReady = false;
 
+    /**
+     * FIX 2: 持有当前 VpnService 实例，供 VlessProxyService 调用 protect()。
+     * onCreate() 时赋值，onDestroy() 时清空，保证不泄漏 Context。
+     */
+    static volatile VlessVpnService instance = null;
+
     private ParcelFileDescriptor vpnFd;
     private Thread               tun2socksThread;
     private String               configJson;
 
     // ── Lifecycle ─────────────────────────────────────────────────────────
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        instance = this;
+    }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -85,8 +99,36 @@ public class VlessVpnService extends VpnService {
 
     @Override
     public void onDestroy() {
+        instance = null; // FIX 2: 清空实例引用，避免内存泄漏
         super.onDestroy();
         stopVpn();
+    }
+
+    // ── FIX 2: 静态 protect 方法，供 VlessProxyService 调用 ───────────────
+
+    /**
+     * 对 VlessProxyService 创建的出站 Socket 调用 VpnService.protect()，
+     * 使其绑定到物理网卡，绕过 TUN 路由，防止代理自循环（proxy loop）。
+     *
+     * 必须在 socket 连接（connect）之前调用，否则无效。
+     *
+     * @param socket 需要排除在 VPN 路由之外的 socket
+     * @return protect() 是否成功；false 表示 VpnService 尚未就绪
+     */
+    public static boolean protectSocket(java.net.Socket socket) {
+        VlessVpnService svc = instance;
+        if (svc == null) {
+            Log.w(TAG, "protectSocket: VlessVpnService instance is null, skipping");
+            return false;
+        }
+        try {
+            boolean ok = svc.protect(socket);
+            if (!ok) Log.w(TAG, "protectSocket: protect() returned false");
+            return ok;
+        } catch (Exception e) {
+            Log.w(TAG, "protectSocket: exception: " + e.getMessage());
+            return false;
+        }
     }
 
     // ── Start ─────────────────────────────────────────────────────────────
@@ -105,7 +147,7 @@ public class VlessVpnService extends VpnService {
         startForegroundService(proxyIntent);
 
         // 4. 等待代理就绪（轮询 proxyReady 标志，由 VlessProxyService 设置）
-        //    FIX: 不再使用 TCP 探测（会被 AppsFilter BLOCKED），改为内存标志
+        //    FIX 1: 不再使用 TCP 探测（会被 AppsFilter BLOCKED），改为内存标志
         Log.i(TAG, "Waiting for SOCKS5 proxy to become ready...");
         if (!waitForProxyReady(10_000)) {
             throw new IOException("SOCKS5 proxy did not become ready in time");
@@ -123,6 +165,8 @@ public class VlessVpnService extends VpnService {
         builder.addDnsServer(DNS_SECONDARY);
         builder.setSession("VLESS VPN");
 
+        // addDisallowedApplication 作为辅助保险：将本 App 流量排除在 TUN 之外。
+        // 主要保护机制是 protectSocket()，两者叠加使用最为健壮。
         try {
             builder.addDisallowedApplication(getPackageName());
         } catch (android.content.pm.PackageManager.NameNotFoundException e) {
@@ -161,8 +205,7 @@ public class VlessVpnService extends VpnService {
     // ── 等待代理就绪（轮询内存标志）────────────────────────────────────────
 
     /**
-     * FIX: 替换原来的 TCP 探测。
-     *
+     * FIX 1: 替换原来的 TCP 探测。
      * VlessProxyService 的 acceptLoop 在 ServerSocket.bind() 成功后
      * 会将 VlessVpnService.proxyReady 设为 true。
      * 这里每 100ms 轮询一次，最多等待 timeoutMs 毫秒。
