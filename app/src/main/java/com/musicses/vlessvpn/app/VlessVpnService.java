@@ -16,16 +16,6 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.Collections;
 
-/**
- * Android VpnService.
- *
- * 对齐参考项目的核心设计：
- * 1. waitForSocks5() 探测 socket 必须先 protect()，否则 VpnService 会把探测包
- *    路由进 TUN（TUN 此时还没建立），导致探测永远失败。
- * 2. addRoute("0.0.0.0", 0) 全量路由 + addDisallowedApplication 排除本 App，
- *    配合 VlessProxyService 内部的 ProtectedDns + socketFactory protect() 解循环。
- * 3. 暴露 instance 引用，让 VlessProxyService 拿到真实 VpnService 对象调用 protect()。
- */
 public class VlessVpnService extends VpnService {
     private static final String TAG       = "VlessVpnService";
     static final String ACTION_START      = "START_VPN";
@@ -42,7 +32,7 @@ public class VlessVpnService extends VpnService {
     private static final String DNS_PRIMARY   = "8.8.8.8";
     private static final String DNS_SECONDARY = "1.1.1.1";
 
-    private static final int SOCKS5_READY_TIMEOUT_SEC = 10;
+    private static final int SOCKS5_READY_TIMEOUT_SEC = 15;
 
     /** 暴露给 VlessProxyService，用于调用 protect() */
     static volatile VlessVpnService instance = null;
@@ -56,6 +46,7 @@ public class VlessVpnService extends VpnService {
     @Override
     public void onCreate() {
         super.onCreate();
+        // FIX: instance 赋值在 onCreate，确保 ProxyService 能及时拿到引用
         instance = this;
     }
 
@@ -89,9 +80,12 @@ public class VlessVpnService extends VpnService {
 
     @Override
     public void onDestroy() {
+        // FIX: 必须先 stopVpn()（释放资源、通知 ProxyService 停止），
+        //      最后才清 instance，确保 ProxyService 的 protect() 在整个停止
+        //      过程中都能拿到有效引用。
+        stopVpn();
         instance = null;
         super.onDestroy();
-        stopVpn();
     }
 
     // ── Start ─────────────────────────────────────────────────────────────
@@ -117,14 +111,12 @@ public class VlessVpnService extends VpnService {
         builder.setMtu(MTU);
         builder.addAddress(TUN_IP4, 24);
         builder.addAddress(TUN_IP6, 64);
-        builder.addRoute("0.0.0.0", 0);   // 全量 IPv4
-        builder.addRoute("::", 0);         // 全量 IPv6
+        builder.addRoute("0.0.0.0", 0);
+        builder.addRoute("::", 0);
         builder.addDnsServer(DNS_PRIMARY);
         builder.addDnsServer(DNS_SECONDARY);
         builder.setSession("VLESS VPN");
 
-        // 排除本 App 流量，防止 Java 层 socket（OkHttp）进 TUN
-        // native tun2socks socket 由 ProtectedDns + socketFactory.protect() 保护
         try {
             builder.addDisallowedApplication(getPackageName());
         } catch (android.content.pm.PackageManager.NameNotFoundException e) {
@@ -159,16 +151,8 @@ public class VlessVpnService extends VpnService {
         tun2socksThread.start();
     }
 
-    // ── 等待 SOCKS5 就绪（对齐参考项目）─────────────────────────────────────
+    // ── 等待 SOCKS5 就绪 ─────────────────────────────────────────────────
 
-    /**
-     * 对参考项目 waitForSocks5() 的精确移植。
-     *
-     * 关键：protect(s) 必须在 s.connect() 之前调用。
-     * 原因：VpnService 建立后，所有未 protect 的 socket 都会被路由进 TUN。
-     * 即使 TUN 还未完全建立，探测包也可能被丢弃导致 connect 超时。
-     * protect() 让探测 socket 直接走物理网卡，确保能连到 127.0.0.1:10800。
-     */
     private boolean waitForSocks5(int timeoutSec) {
         long deadline = System.currentTimeMillis() + timeoutSec * 1000L;
         while (System.currentTimeMillis() < deadline) {
@@ -180,7 +164,7 @@ public class VlessVpnService extends VpnService {
                 return true;
             } catch (IOException e) {
                 try { s.close(); } catch (IOException ignored) {}
-                try { Thread.sleep(150); } catch (InterruptedException ie) { return false; }
+                try { Thread.sleep(200); } catch (InterruptedException ie) { return false; }
             }
         }
         return false;
@@ -189,15 +173,23 @@ public class VlessVpnService extends VpnService {
     // ── Stop ──────────────────────────────────────────────────────────────
 
     private void stopVpn() {
+        // 1. 先停 tun2socks（让 TUN fd 可以安全关闭）
         try { Tun2Socks.stopTun2Socks(); } catch (Exception ignored) {}
+
+        // 2. 等待 tun2socks 线程退出（最多 2s），再关 fd
         if (tun2socksThread != null) {
             tun2socksThread.interrupt();
+            try { tun2socksThread.join(2000); } catch (InterruptedException ignored) {}
             tun2socksThread = null;
         }
+
+        // 3. 关闭 TUN fd
         if (vpnFd != null) {
             try { vpnFd.close(); } catch (IOException ignored) {}
             vpnFd = null;
         }
+
+        // 4. 通知 VlessProxyService 停止（instance 此时仍有效，protect() 能正常工作）
         Intent proxyStop = new Intent(this, VlessProxyService.class);
         proxyStop.setAction(VlessProxyService.ACTION_STOP);
         startService(proxyStop);

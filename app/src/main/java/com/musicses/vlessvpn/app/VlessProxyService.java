@@ -51,24 +51,6 @@ import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
 import okio.ByteString;
 
-/**
- * VLESS SOCKS5 代理服务。
- *
- * 完整移植参考项目（VlessVpn-android 2）的核心设计：
- *
- * 1. ProtectedDns：用 DatagramSocket + vpnService.protect() 直接向 8.8.8.8/8.8.4.4
- *    发 DNS 查询，完全绕过系统 DNS 栈，不走 TUN，彻底消除 DNS 死循环。
- *    （参考项目 VlessTunnel.ProtectedDns 的精确 Java 移植）
- *
- * 2. socketFactory：每个 socket 在 createSocket() 时立即调用 vpnService.protect()，
- *    将 TCP socket 绑定到物理网卡，不走 TUN。
- *
- * 3. VpnService 引用通过 VlessVpnService.instance 获取，不需要改变 Service 继承关系。
- *
- * 4. 每个连接独立创建 OkHttpClient（对齐参考项目，不共享连接池）。
- *
- * 5. VLESS 协议：onOpen 发送 header（可含 earlyData），relay 直接转发原始数据。
- */
 public class VlessProxyService extends Service {
     private static final String TAG = "VlessProxy";
     static final String ACTION_START = "START";
@@ -82,6 +64,9 @@ public class VlessProxyService extends Service {
     private ExecutorService pool;
     private VlessConfig     cfg;
 
+    // FIX: 用于追踪 acceptLoop 线程，确保重启时旧端口已释放
+    private Thread acceptThread;
+
     static volatile String lastStatus = "Stopped";
 
     // ── Lifecycle ─────────────────────────────────────────────────────────
@@ -89,7 +74,10 @@ public class VlessProxyService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent == null) return START_NOT_STICKY;
-        if (ACTION_STOP.equals(intent.getAction())) { stopSelf(); return START_NOT_STICKY; }
+        if (ACTION_STOP.equals(intent.getAction())) {
+            stopSelf();
+            return START_NOT_STICKY;
+        }
 
         String json = intent.getStringExtra(EXTRA_CONFIG);
         cfg = ConfigStore.fromJson(json);
@@ -97,9 +85,22 @@ public class VlessProxyService extends Service {
             Log.e(TAG, "Invalid config"); stopSelf(); return START_NOT_STICKY;
         }
 
+        // FIX: 重启时先关闭旧的 ServerSocket，保证端口释放后再重新绑定
+        //      防止 "Address already in use" 导致第二次连接的 waitForSocks5 超时
+        closeServerSocket();
+
         startForeground(NOTIF_ID, buildNotification("VLESS proxy running"));
+
+        if (pool != null) {
+            pool.shutdownNow();
+        }
         pool = Executors.newCachedThreadPool();
-        pool.execute(this::acceptLoop);
+
+        // FIX: 在独立线程中启动 acceptLoop，并保存引用以便后续管理
+        acceptThread = new Thread(this::acceptLoop, "vless-accept");
+        acceptThread.setDaemon(true);
+        acceptThread.start();
+
         lastStatus = "Proxy running on :" + VlessConfig.SOCKS5_PORT;
         return START_STICKY;
     }
@@ -108,29 +109,65 @@ public class VlessProxyService extends Service {
     public void onDestroy() {
         super.onDestroy();
         lastStatus = "Stopped";
-        if (pool != null) pool.shutdownNow();
-        try { if (serverSocket != null) serverSocket.close(); } catch (IOException ignored) {}
+        if (pool != null) {
+            pool.shutdownNow();
+            pool = null;
+        }
+        closeServerSocket();
+        // FIX: 等待 acceptThread 退出，确保端口真正释放，再让 VlessVpnService 的
+        //      下一次 waitForSocks5 开始轮询（最多等 1s）
+        if (acceptThread != null) {
+            acceptThread.interrupt();
+            try { acceptThread.join(1000); } catch (InterruptedException ignored) {}
+            acceptThread = null;
+        }
     }
 
     @Nullable @Override
     public IBinder onBind(Intent intent) { return null; }
 
+    // ── 安全关闭 ServerSocket ─────────────────────────────────────────────
+
+    /**
+     * FIX: 集中管理 ServerSocket 关闭逻辑。
+     *
+     * 原代码 onDestroy 里直接 serverSocket.close() 后立即返回，
+     * 但 OS 的 TIME_WAIT 状态可能让端口在短时间内仍不可绑定。
+     * 使用 SO_REUSEADDR（ServerSocket 默认已开启）配合此方法确保干净关闭。
+     */
+    private void closeServerSocket() {
+        ServerSocket ss = serverSocket;
+        serverSocket = null;
+        if (ss != null && !ss.isClosed()) {
+            try { ss.close(); } catch (IOException ignored) {}
+        }
+    }
+
     // ── Accept loop ───────────────────────────────────────────────────────
 
     private void acceptLoop() {
         try {
-            serverSocket = new ServerSocket(VlessConfig.SOCKS5_PORT, 512,
-                    InetAddress.getByName("127.0.0.1"));
+            // FIX: 设置 SO_REUSEADDR，确保重启时能立即绑定同一端口
+            ServerSocket ss = new ServerSocket();
+            ss.setReuseAddress(true);
+            ss.bind(new java.net.InetSocketAddress(
+                    InetAddress.getByName("127.0.0.1"), VlessConfig.SOCKS5_PORT), 512);
+            serverSocket = ss;
+
             Log.i(TAG, "SOCKS5 listening on :127.0.0.1:" + VlessConfig.SOCKS5_PORT);
 
-            while (!serverSocket.isClosed()) {
-                Socket client = serverSocket.accept();
+            while (!ss.isClosed() && !Thread.currentThread().isInterrupted()) {
+                Socket client = ss.accept();
                 client.setTcpNoDelay(true);
                 pool.execute(() -> handleSocks5(client));
             }
         } catch (IOException e) {
-            if (serverSocket != null && !serverSocket.isClosed())
+            ServerSocket ss = serverSocket;
+            if (ss == null || ss.isClosed()) {
+                Log.i(TAG, "acceptLoop ended (socket closed)");
+            } else {
                 Log.e(TAG, "accept error: " + e.getMessage());
+            }
         }
     }
 
@@ -156,7 +193,7 @@ public class VlessProxyService extends Service {
             switch (req[3]) {
                 case 0x01: {
                     byte[] ip = readN(in, 4); if (ip == null) { sock.close(); return; }
-                    host = (ip[0]&0xFF)+"."+( ip[1]&0xFF)+"."+( ip[2]&0xFF)+"."+( ip[3]&0xFF);
+                    host = (ip[0]&0xFF)+"."+(ip[1]&0xFF)+"."+(ip[2]&0xFF)+"."+(ip[3]&0xFF);
                     port = readUint16(in); break;
                 }
                 case 0x03: {
@@ -175,7 +212,6 @@ public class VlessProxyService extends Service {
             Log.d(TAG, "SOCKS5 CONNECT → " + host + ":" + port);
             out.write(new byte[]{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); out.flush();
 
-            // 收集 earlyData（非阻塞，仅读已到达的数据）
             sock.setSoTimeout(0);
             byte[] earlyData = collectEarlyData(in);
             if (earlyData != null) Log.d(TAG, "earlyData: " + earlyData.length + "B");
@@ -192,7 +228,6 @@ public class VlessProxyService extends Service {
 
     private void openTunnelAndRelay(Socket sock, InputStream in, OutputStream out,
                                     String destHost, int destPort, byte[] earlyData) {
-        // 每个连接独立创建 OkHttpClient（对齐参考项目）
         OkHttpClient client = buildClient();
         String wsUrl = cfg.buildWsUrl();
 
@@ -219,7 +254,6 @@ public class VlessProxyService extends Service {
                 if (!wsRef.compareAndSet(null, ws)) { ws.cancel(); return; }
                 Log.i(TAG, "WS onOpen → " + destHost + ":" + destPort);
 
-                // 发送 VLESS header + earlyData（对齐参考项目 onOpen 逻辑）
                 byte[] header = VlessHeader.build(cfg.uuid, destHost, destPort);
                 byte[] firstPkt = (earlyData != null && earlyData.length > 0)
                         ? concat(header, earlyData) : header;
@@ -254,7 +288,6 @@ public class VlessProxyService extends Service {
             }
         });
 
-        // 等待 WS 打开
         try {
             if (!openLatch.await(30, TimeUnit.SECONDS) || !openOk.get()) {
                 Log.e(TAG, "WS open timeout or failed for " + destHost + ":" + destPort);
@@ -269,7 +302,7 @@ public class VlessProxyService extends Service {
         WebSocket ws = wsRef.get();
         AtomicBoolean relayDone = new AtomicBoolean(false);
 
-        // 下游：WS → sock（剥离 VLESS 响应头，对齐参考项目 relay onMsg）
+        // 下游：WS → sock（剥离 VLESS 响应头）
         Thread t1 = new Thread(() -> {
             byte[] respBuf = new byte[0];
             boolean respSkipped = false;
@@ -306,7 +339,7 @@ public class VlessProxyService extends Service {
         }, "VT-ws2l-" + destPort);
         t1.setDaemon(true);
 
-        // 上游：sock → WS（直接转发，不拼接 header，header 已在 onOpen 发送）
+        // 上游：sock → WS
         Thread t2 = new Thread(() -> {
             byte[] buf = new byte[32768];
             try {
@@ -334,10 +367,6 @@ public class VlessProxyService extends Service {
 
     // ── OkHttpClient：ProtectedDns + socketFactory + TLS ─────────────────
 
-    /**
-     * 移植参考项目 VlessTunnel.buildClient()。
-     * 核心：ProtectedDns + socketFactory.protect() + trust-all TLS。
-     */
     private OkHttpClient buildClient() {
         VpnService vpnSvc = VlessVpnService.instance;
 
@@ -355,7 +384,6 @@ public class VlessProxyService extends Service {
             throw new RuntimeException("TLS init failed", e);
         }
 
-        // SNI 注入
         final String sniHost = (cfg.sni != null && !cfg.sni.isEmpty()) ? cfg.sni : cfg.server;
         SSLSocketFactory baseFactory = sslCtx.getSocketFactory();
         SSLSocketFactory sniFactory = new SSLSocketFactory() {
@@ -386,16 +414,13 @@ public class VlessProxyService extends Service {
                 .pingInterval(25, TimeUnit.SECONDS)
                 .hostnameVerifier((h, s) -> true)
                 .sslSocketFactory(sniFactory, trustAll)
-                // ProtectedDns：移植参考项目，用 UDP protect() 做 DNS 解析，不走 TUN
                 .dns(new ProtectedDns(cfg.server, vpnSvc));
 
         if (vpnSvc != null) {
-            // socketFactory：每个 TCP socket 在 createSocket() 时 protect()
             final VpnService finalSvc = vpnSvc;
             builder.socketFactory(new SocketFactory() {
                 private final SocketFactory def = SocketFactory.getDefault();
                 private Socket p(Socket s) {
-                    // s.setTcpNoDelay(true); // 减少延迟
                     if (!finalSvc.protect(s))
                         Log.e(TAG, "protect(socket) FAILED — possible routing loop!");
                     return s;
@@ -413,18 +438,8 @@ public class VlessProxyService extends Service {
         return builder.build();
     }
 
-    // ── ProtectedDns（移植参考项目 VlessTunnel.ProtectedDns）─────────────
+    // ── ProtectedDns ──────────────────────────────────────────────────────
 
-    /**
-     * 用受保护的 DatagramSocket 直接向 8.8.8.8/8.8.4.4 发 DNS A 记录查询。
-     *
-     * 为什么需要这个：
-     *   VPN 建立后，系统 DNS 查询走 TUN → tun2socks → SOCKS5 → 触发新的 WebSocket
-     *   → 新的 DNS 查询 → 死循环，onOpen 永远不触发。
-     *
-     *   ProtectedDns 用 vpnService.protect(udpSocket) 让 DNS UDP 包走物理网卡，
-     *   完全绕过 TUN，彻底消除 DNS 死循环。
-     */
     private static class ProtectedDns implements Dns {
         private static final String[] DNS_SERVERS = {"8.8.8.8", "8.8.4.4"};
         private static final long     TIMEOUT_MS  = 3_000L;
@@ -432,7 +447,6 @@ public class VlessProxyService extends Service {
         private final String     serverHost;
         private final VpnService vpnService;
 
-        // 会话级缓存：同一 VlessTunnel 实例的多次 lookup 复用
         private volatile List<InetAddress> sessionCache = null;
 
         ProtectedDns(String serverHost, VpnService vpnService) {
@@ -442,7 +456,6 @@ public class VlessProxyService extends Service {
 
         @Override
         public List<InetAddress> lookup(String hostname) throws UnknownHostException {
-            // 非目标域名直接用系统 DNS（不应出现）
             if (!serverHost.equals(hostname)) {
                 Log.w("ProtectedDns", "Unexpected host: " + hostname);
                 return Dns.SYSTEM.lookup(hostname);
@@ -457,7 +470,6 @@ public class VlessProxyService extends Service {
                 return resolved;
             }
 
-            // 回退：系统 DNS（vpnService 为 null 时，即模拟器无 VPN 场景）
             Log.w("ProtectedDns", "Protected DNS failed, falling back to system DNS");
             List<InetAddress> fallback = Dns.SYSTEM.lookup(hostname);
             if (!fallback.isEmpty()) { sessionCache = fallback; return fallback; }
@@ -479,7 +491,7 @@ public class VlessProxyService extends Service {
                 Thread t = new Thread(() -> {
                     try {
                         DatagramSocket sock = new DatagramSocket();
-                        vpnService.protect(sock);  // ← 关键：DNS UDP 包走物理网卡
+                        vpnService.protect(sock);
                         sock.setSoTimeout((int) TIMEOUT_MS);
                         try {
                             InetAddress dest = InetAddress.getByName(dnsIp);
@@ -508,31 +520,24 @@ public class VlessProxyService extends Service {
             return result.get();
         }
 
-        /** 构造 DNS A 记录查询包 */
         private static byte[] buildDnsQuery(String hostname) {
             ByteArrayOutputStream out = new ByteArrayOutputStream();
-            // Transaction ID
             out.write(0x12); out.write(0x34);
-            // Flags: standard query
             out.write(0x01); out.write(0x00);
-            // QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
             out.write(0x00); out.write(0x01);
             out.write(0x00); out.write(0x00);
             out.write(0x00); out.write(0x00);
             out.write(0x00); out.write(0x00);
-            // QNAME
             for (String label : hostname.split("\\.")) {
                 out.write(label.length());
                 for (byte b : label.getBytes()) out.write(b);
             }
             out.write(0x00);
-            // QTYPE=A(1), QCLASS=IN(1)
             out.write(0x00); out.write(0x01);
             out.write(0x00); out.write(0x01);
             return out.toByteArray();
         }
 
-        /** 解析 DNS 响应，提取所有 A 记录 */
         private static List<InetAddress> parseDnsARecords(byte[] buf, int len) {
             java.util.List<InetAddress> result = new java.util.ArrayList<>();
             if (len < 12) return result;
@@ -540,7 +545,6 @@ public class VlessProxyService extends Service {
             int anCount = ((buf[6] & 0xFF) << 8) | (buf[7] & 0xFF);
             if (anCount == 0) return result;
 
-            // 跳过 Question section
             int pos = 12;
             while (pos < len) {
                 int b = buf[pos] & 0xFF;
@@ -548,11 +552,9 @@ public class VlessProxyService extends Service {
                 if (b == 0) { pos++; break; }
                 pos += b + 1;
             }
-            pos += 4; // skip QTYPE + QCLASS
+            pos += 4;
 
-            // 解析 Answer section
             for (int i = 0; i < anCount && pos < len; i++) {
-                // Name（可能是指针或 label）
                 if ((buf[pos] & 0xC0) == 0xC0) {
                     pos += 2;
                 } else {
@@ -582,7 +584,6 @@ public class VlessProxyService extends Service {
 
     // ── I/O helpers ───────────────────────────────────────────────────────
 
-    /** 非阻塞收集已到达的 earlyData */
     private byte[] collectEarlyData(InputStream in) {
         try {
             int avail = in.available();
