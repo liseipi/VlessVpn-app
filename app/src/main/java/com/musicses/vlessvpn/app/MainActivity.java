@@ -119,6 +119,8 @@ public class MainActivity extends AppCompatActivity implements VpnStateHolder.Li
     private void onToggleVpn() {
         if (VpnStateHolder.getState() == VpnStateHolder.State.CONNECTED) {
             stopVpn();
+        } else if (VpnStateHolder.getState() == VpnStateHolder.State.CONNECTING) {
+            toast("Connecting, please wait...");
         } else {
             requestVpnPermission();
         }
@@ -133,6 +135,10 @@ public class MainActivity extends AppCompatActivity implements VpnStateHolder.Li
         }
     }
 
+    /**
+     * 所有连接请求统一走 ACTION_RESTART，在 Service 内部串行执行 stop→start。
+     * 这样无论 Service 处于什么状态（首次启动、重连、残留），都能安全启动。
+     */
     private void doStartVpn() {
         VlessConfig cfg = ConfigStore.getActive(this);
         if (cfg == null) {
@@ -140,9 +146,8 @@ public class MainActivity extends AppCompatActivity implements VpnStateHolder.Li
             return;
         }
         VpnStateHolder.setState(VpnStateHolder.State.CONNECTING);
-
         Intent intent = new Intent(this, VlessVpnService.class);
-        intent.setAction(VlessVpnService.ACTION_START);
+        intent.setAction(VlessVpnService.ACTION_RESTART);
         intent.putExtra(VlessVpnService.EXTRA_CONFIG_JSON, ConfigStore.toJson(cfg));
         startForegroundService(intent);
     }
