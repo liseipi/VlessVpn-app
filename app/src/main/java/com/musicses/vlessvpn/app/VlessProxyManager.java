@@ -7,7 +7,6 @@ import android.net.NetworkCapabilities;
 import android.net.VpnService;
 import android.util.Log;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -43,45 +42,33 @@ import okio.ByteString;
 /**
  * 处理单个 SOCKS5 客户端连接并通过 VLESS WebSocket 转发流量。
  *
- * ═══════════════════════════════════════════════════════════
- * 核心修复：彻底废弃 protect(socket)，改用 Network API
- * ═══════════════════════════════════════════════════════════
- *
- * 问题根源：
- *   真机（尤其 MIUI）上 VpnService.protect(socket) 对 OkHttp 创建的
- *   socket 持续返回 false，导致 WS 连接的 socket 没有被排除在 VPN 之外，
- *   流量绕回 TUN 接口形成死循环，WS 永远无法建立。
- *   同时 ProtectedDns 的 UDP DatagramSocket protect 也失败，
- *   导致 DNS 查询走进 TUN → 超时 → 服务器域名无法解析。
- *
- * 解决方案：
- *   通过 ConnectivityManager 找到底层物理网络（非 VPN 的 Network 对象），
- *   直接用 network.getSocketFactory() 创建 socket。
- *   这类 socket 在内核层面直接绑定到物理网卡，天然不走 TUN，
- *   完全不需要调用 protect()。
- *   DNS 解析同样通过该 Network 完成，绝不走 TUN。
+ * 修复了以下问题：
+ * 1. earlyData 竞态：去除不可靠的 available() 探测，直接在 WS 建立后读取上游数据
+ * 2. relay 逻辑优化：先建立 WS，再开始双向 relay，避免数据丢失
+ * 3. OkHttpClient 按 VPN 连接生命周期复用，减少不必要的 socket 创建
  */
 public class VlessProxyManager {
     private static final String TAG = "VlessProxy";
 
+    // 读取缓冲区大小
+    private static final int BUF_SIZE = 32768;
+
     private final VpnService  vpnService;
     private final VlessConfig cfg;
 
-    public VlessProxyManager(VpnService vpnService, VlessConfig cfg) {
-        this.vpnService = vpnService;
-        this.cfg        = cfg;
+    // 每个 VlessProxyManager 实例共享一个 OkHttpClient
+    // 由 VlessVpnService 传入，生命周期与 VPN 连接一致
+    private final OkHttpClient sharedClient;
+
+    public VlessProxyManager(VpnService vpnService, VlessConfig cfg, OkHttpClient sharedClient) {
+        this.vpnService   = vpnService;
+        this.cfg          = cfg;
+        this.sharedClient = sharedClient;
     }
 
     // ── 获取底层物理 Network ──────────────────────────────────────────────
 
-    /**
-     * 遍历所有 Network，找到有 INTERNET 能力、但不是 VPN 的物理网络。
-     * 优先返回 WIFI，其次 CELLULAR，都没有则返回第一个非 VPN 网络。
-     *
-     * 这是替代 protect() 的核心：用这个 Network 的 SocketFactory 创建的
-     * socket 会直接走物理网卡，不经过 TUN。
-     */
-    private Network getUnderlyingNetwork() {
+    public static Network getUnderlyingNetwork(VpnService vpnService) {
         ConnectivityManager cm = (ConnectivityManager)
                 vpnService.getSystemService(Context.CONNECTIVITY_SERVICE);
         if (cm == null) return null;
@@ -106,10 +93,7 @@ public class VlessProxyManager {
                 }
             }
         } catch (SecurityException e) {
-            // ACCESS_NETWORK_STATE 权限缺失，AndroidManifest.xml 里必须声明该权限
-            Log.e(TAG, "Missing ACCESS_NETWORK_STATE permission! " +
-                    "Add <uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\"/> " +
-                    "to AndroidManifest.xml. Error: " + e.getMessage());
+            Log.e(TAG, "Missing ACCESS_NETWORK_STATE: " + e.getMessage());
             return null;
         }
 
@@ -117,12 +101,86 @@ public class VlessProxyManager {
                 : cellNet != null ? cellNet
                 : fallbackNet;
 
-        if (result == null) {
-            Log.w(TAG, "No underlying physical network found");
-        } else {
-            Log.d(TAG, "Using underlying network: " + result);
-        }
+        if (result != null) Log.d(TAG, "Using underlying network: " + result);
         return result;
+    }
+
+    // ── 构建共享 OkHttpClient ────────────────────────────────────────────
+
+    public static OkHttpClient buildSharedClient(VpnService vpnService, VlessConfig cfg) {
+        Network underlyingNetwork = getUnderlyingNetwork(vpnService);
+
+        X509TrustManager trustAll = new X509TrustManager() {
+            @Override public void checkClientTrusted(X509Certificate[] c, String a) {}
+            @Override public void checkServerTrusted(X509Certificate[] c, String a) {}
+            @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+        };
+
+        SSLContext sslCtx;
+        try {
+            sslCtx = SSLContext.getInstance("TLS");
+            sslCtx.init(null, new TrustManager[]{trustAll}, new SecureRandom());
+        } catch (Exception e) {
+            throw new RuntimeException("TLS init failed", e);
+        }
+
+        final String sniHost = (cfg.sni != null && !cfg.sni.isEmpty()) ? cfg.sni : cfg.server;
+        final SSLSocketFactory baseFactory = sslCtx.getSocketFactory();
+
+        final javax.net.SocketFactory physicalFactory;
+        if (underlyingNetwork != null) {
+            physicalFactory = underlyingNetwork.getSocketFactory();
+            Log.d(TAG, "Using Network.getSocketFactory() - no protect() needed");
+        } else {
+            Log.w(TAG, "No physical network, falling back to protect()");
+            final VpnService svc = vpnService;
+            physicalFactory = new javax.net.SocketFactory() {
+                private final javax.net.SocketFactory def = javax.net.SocketFactory.getDefault();
+                private java.net.Socket p(java.net.Socket s) {
+                    if (!svc.protect(s)) Log.e(TAG, "protect(socket) FAILED");
+                    return s;
+                }
+                @Override public java.net.Socket createSocket() throws java.io.IOException { return p(def.createSocket()); }
+                @Override public java.net.Socket createSocket(String h, int port) throws java.io.IOException { return p(def.createSocket(h, port)); }
+                @Override public java.net.Socket createSocket(String h, int port, java.net.InetAddress la, int lp) throws java.io.IOException { return p(def.createSocket(h, port, la, lp)); }
+                @Override public java.net.Socket createSocket(java.net.InetAddress a, int port) throws java.io.IOException { return p(def.createSocket(a, port)); }
+                @Override public java.net.Socket createSocket(java.net.InetAddress a, int port, java.net.InetAddress la, int lp) throws java.io.IOException { return p(def.createSocket(a, port, la, lp)); }
+            };
+        }
+
+        SSLSocketFactory sniPhysicalFactory = new SSLSocketFactory() {
+            private SSLSocket upgradeToSsl(java.net.Socket plain) throws IOException {
+                SSLSocket ssl = (SSLSocket) baseFactory.createSocket(
+                        plain, sniHost, plain.getPort(), true);
+                SSLParameters p = ssl.getSSLParameters();
+                p.setServerNames(Collections.singletonList(new SNIHostName(sniHost)));
+                ssl.setSSLParameters(p);
+                return ssl;
+            }
+            @Override public String[] getDefaultCipherSuites() { return baseFactory.getDefaultCipherSuites(); }
+            @Override public String[] getSupportedCipherSuites() { return baseFactory.getSupportedCipherSuites(); }
+            @Override public java.net.Socket createSocket(java.net.Socket s, String host, int port, boolean autoClose) throws IOException { return upgradeToSsl(s); }
+            @Override public java.net.Socket createSocket() throws IOException { return physicalFactory.createSocket(); }
+            @Override public java.net.Socket createSocket(String host, int port) throws IOException { return upgradeToSsl(physicalFactory.createSocket(host, port)); }
+            @Override public java.net.Socket createSocket(String host, int port, java.net.InetAddress la, int lp) throws IOException { return upgradeToSsl(physicalFactory.createSocket(host, port, la, lp)); }
+            @Override public java.net.Socket createSocket(java.net.InetAddress addr, int port) throws IOException { return upgradeToSsl(physicalFactory.createSocket(addr, port)); }
+            @Override public java.net.Socket createSocket(java.net.InetAddress addr, int port, java.net.InetAddress la, int lp) throws IOException { return upgradeToSsl(physicalFactory.createSocket(addr, port, la, lp)); }
+        };
+
+        Dns physicalDns = underlyingNetwork != null
+                ? new NetworkBoundDns(underlyingNetwork, cfg.server)
+                : Dns.SYSTEM;
+
+        return new OkHttpClient.Builder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(0,     TimeUnit.SECONDS)   // 关键：WebSocket 不能有读超时
+                .writeTimeout(30,   TimeUnit.SECONDS)
+                .pingInterval(25,   TimeUnit.SECONDS)
+                .hostnameVerifier((h, s) -> true)
+                .sslSocketFactory(sniPhysicalFactory, trustAll)
+                .socketFactory(physicalFactory)
+                .dns(physicalDns)
+                .build();
     }
 
     // ── SOCKS5 入口 ───────────────────────────────────────────────────────
@@ -164,13 +222,15 @@ public class VlessProxyManager {
             }
 
             Log.d(TAG, "SOCKS5 CONNECT → " + host + ":" + port);
-            out.write(new byte[]{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); out.flush();
 
+            // 立即回复 SOCKS5 成功，告知 tun2socks 可以发数据了
+            out.write(new byte[]{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0});
+            out.flush();
+
+            // 取消读超时，进入 relay 阶段
             sock.setSoTimeout(0);
-            byte[] earlyData = collectEarlyData(in);
-            if (earlyData != null) Log.d(TAG, "earlyData: " + earlyData.length + "B");
 
-            openTunnelAndRelay(sock, in, out, host, port, earlyData);
+            openTunnelAndRelay(sock, in, out, host, port);
 
         } catch (Exception e) {
             Log.w(TAG, "socks5 error: " + e.getMessage());
@@ -181,10 +241,7 @@ public class VlessProxyManager {
     // ── VLESS WebSocket 隧道 ──────────────────────────────────────────────
 
     private void openTunnelAndRelay(Socket sock, InputStream in, OutputStream out,
-                                    String destHost, int destPort, byte[] earlyData) {
-        // 每次连接都重新获取，确保在网络切换后能自动适应
-        Network underlyingNetwork = getUnderlyingNetwork();
-        OkHttpClient client = buildClient(underlyingNetwork);
+                                    String destHost, int destPort) {
         String wsUrl = cfg.buildWsUrl();
 
         Request request = new Request.Builder()
@@ -197,53 +254,58 @@ public class VlessProxyManager {
 
         Log.i(TAG, "Opening WS → " + wsUrl + "  target=" + destHost + ":" + destPort);
 
-        LinkedBlockingQueue<byte[]> inQueue = new LinkedBlockingQueue<>(4000);
-        byte[] END_MARKER = new byte[0];
-        AtomicBoolean closed = new AtomicBoolean(false);
+        // BUG FIX 1: 使用无界队列避免生产者阻塞
+        LinkedBlockingQueue<byte[]> downQueue = new LinkedBlockingQueue<>();
+        final byte[] END_MARKER = new byte[0];
+        AtomicBoolean relayDone = new AtomicBoolean(false);
         AtomicReference<WebSocket> wsRef = new AtomicReference<>(null);
         CountDownLatch openLatch = new CountDownLatch(1);
         AtomicBoolean openOk = new AtomicBoolean(false);
 
-        client.newWebSocket(request, new WebSocketListener() {
+        sharedClient.newWebSocket(request, new WebSocketListener() {
             @Override
             public void onOpen(WebSocket ws, Response response) {
-                if (!wsRef.compareAndSet(null, ws)) { ws.cancel(); return; }
-                Log.i(TAG, "WS onOpen → " + destHost + ":" + destPort);
+                wsRef.set(ws);
+                // BUG FIX 2: onOpen 时只发送 VLESS header，不发 earlyData
+                // earlyData 由上游 relay 线程负责读取和发送，避免竞态
                 byte[] header = VlessHeader.build(cfg.uuid, destHost, destPort);
-                byte[] firstPkt = (earlyData != null && earlyData.length > 0)
-                        ? concat(header, earlyData) : header;
-                ws.send(ByteString.of(firstPkt));
+                ws.send(ByteString.of(header));
                 openOk.set(true);
                 openLatch.countDown();
+                Log.i(TAG, "WS onOpen → " + destHost + ":" + destPort);
             }
 
             @Override
             public void onMessage(WebSocket ws, ByteString bytes) {
-                if (!closed.get() && bytes.size() > 0) inQueue.offer(bytes.toByteArray());
+                if (!relayDone.get() && bytes.size() > 0) {
+                    downQueue.offer(bytes.toByteArray());
+                }
             }
 
             @Override
             public void onClosing(WebSocket ws, int code, String reason) {
                 Log.d(TAG, "WS closing: " + code);
-                inQueue.offer(END_MARKER); ws.cancel();
+                downQueue.offer(END_MARKER);
+                ws.cancel();
             }
 
             @Override
             public void onClosed(WebSocket ws, int code, String reason) {
-                inQueue.offer(END_MARKER);
+                downQueue.offer(END_MARKER);
             }
 
             @Override
             public void onFailure(WebSocket ws, Throwable t, Response response) {
                 Log.e(TAG, "WS onFailure: " + t.getClass().getSimpleName() + ": " + t.getMessage());
-                inQueue.offer(END_MARKER);
+                downQueue.offer(END_MARKER);
                 openLatch.countDown();
             }
         });
 
+        // 等待 WS 建立
         try {
-            if (!openLatch.await(30, TimeUnit.SECONDS) || !openOk.get()) {
-                Log.e(TAG, "WS open timeout or failed for " + destHost + ":" + destPort);
+            if (!openLatch.await(15, TimeUnit.SECONDS) || !openOk.get()) {
+                Log.e(TAG, "WS open timeout/failed for " + destHost + ":" + destPort);
                 try { sock.close(); } catch (IOException ignored) {}
                 return;
             }
@@ -253,201 +315,100 @@ public class VlessProxyManager {
         }
 
         WebSocket ws = wsRef.get();
+        if (ws == null) {
+            try { sock.close(); } catch (IOException ignored) {}
+            return;
+        }
 
-        // 下游：WS → sock（剥离 VLESS 响应头）
-        Thread t1 = new Thread(() -> {
+        // ── 下游线程：WS → sock（剥离 VLESS 响应头）──
+        Thread downThread = new Thread(() -> {
             byte[] respBuf = new byte[0];
             boolean respSkipped = false;
             int respHdrSize = -1;
             try {
-                while (!closed.get()) {
-                    byte[] chunk = inQueue.poll(120, TimeUnit.SECONDS);
+                while (!relayDone.get()) {
+                    // BUG FIX 3: 使用有超时的 poll，避免永久阻塞
+                    byte[] chunk = downQueue.poll(120, TimeUnit.SECONDS);
                     if (chunk == null || chunk == END_MARKER) break;
+
                     byte[] payload;
                     if (respSkipped) {
                         payload = chunk;
                     } else {
                         respBuf = concat(respBuf, chunk);
                         if (respBuf.length < 2) continue;
-                        if (respHdrSize == -1) respHdrSize = 2 + (respBuf[1] & 0xFF);
+                        if (respHdrSize == -1) {
+                            respHdrSize = 2 + (respBuf[1] & 0xFF);
+                        }
                         if (respBuf.length < respHdrSize) continue;
                         respSkipped = true;
                         payload = respBuf.length > respHdrSize
                                 ? Arrays.copyOfRange(respBuf, respHdrSize, respBuf.length)
                                 : null;
-                        respBuf = new byte[0];
+                        respBuf = null; // GC
                     }
+
                     if (payload != null && payload.length > 0) {
-                        try { out.write(payload); out.flush(); }
-                        catch (Exception e) { break; }
+                        out.write(payload);
+                        out.flush();
                     }
                 }
-            } catch (Exception ignored) {
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                if (!relayDone.get()) {
+                    Log.d(TAG, "downstream error [" + destHost + ":" + destPort + "]: " + e.getMessage());
+                }
             } finally {
+                relayDone.set(true);
                 try { out.close(); } catch (IOException ignored) {}
             }
-        }, "VT-ws2l-" + destPort);
-        t1.setDaemon(true);
+        }, "VT-down-" + destPort);
+        downThread.setDaemon(true);
 
-        // 上游：sock → WS
-        Thread t2 = new Thread(() -> {
-            byte[] buf = new byte[32768];
+        // ── 上游线程：sock → WS ──
+        // BUG FIX 4: 上游线程负责读取实际数据并发送，不再依赖 earlyData
+        Thread upThread = new Thread(() -> {
+            byte[] buf = new byte[BUF_SIZE];
             try {
-                while (!closed.get()) {
-                    int n;
-                    try { n = in.read(buf); } catch (Exception e) { break; }
+                while (!relayDone.get()) {
+                    int n = in.read(buf);
                     if (n < 0) break;
-                    if (!ws.send(ByteString.of(buf, 0, n))) break;
+                    if (n > 0) {
+                        // BUG FIX 5: 检查 send() 返回值，若 false 说明发送队列满或 WS 已关闭
+                        if (!ws.send(ByteString.of(buf, 0, n))) {
+                            Log.d(TAG, "WS send() returned false, upstream closing");
+                            break;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                if (!relayDone.get()) {
+                    Log.d(TAG, "upstream error [" + destHost + ":" + destPort + "]: " + e.getMessage());
                 }
             } finally {
-                inQueue.offer(END_MARKER);
+                // 上游结束 → 通知下游
+                downQueue.offer(END_MARKER);
                 ws.cancel();
             }
-        }, "VT-l2ws-" + destPort);
-        t2.setDaemon(true);
+        }, "VT-up-" + destPort);
+        upThread.setDaemon(true);
 
-        t1.start(); t2.start();
-        try { t1.join(); t2.join(); } catch (InterruptedException ignored) {}
-        closed.set(true);
+        downThread.start();
+        upThread.start();
+
+        try {
+            downThread.join();
+            upThread.join(3_000); // 给上游最多 3s 清理时间
+        } catch (InterruptedException ignored) {}
+
+        relayDone.set(true);
         try { sock.close(); } catch (IOException ignored) {}
         Log.d(TAG, "relay ended [" + destHost + ":" + destPort + "]");
     }
 
-    // ── OkHttpClient：基于 Network API，彻底不用 protect() ───────────────
+    // ── NetworkBoundDns ───────────────────────────────────────────────────
 
-    private OkHttpClient buildClient(Network underlyingNetwork) {
-
-        // Trust-all TLS
-        X509TrustManager trustAll = new X509TrustManager() {
-            @Override public void checkClientTrusted(X509Certificate[] c, String a) {}
-            @Override public void checkServerTrusted(X509Certificate[] c, String a) {}
-            @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-        };
-
-        SSLContext sslCtx;
-        try {
-            sslCtx = SSLContext.getInstance("TLS");
-            sslCtx.init(null, new TrustManager[]{trustAll}, new SecureRandom());
-        } catch (Exception e) {
-            throw new RuntimeException("TLS init failed", e);
-        }
-
-        // SNI-aware SSLSocketFactory，基于 underlyingNetwork 的原始 SocketFactory
-        final String sniHost = (cfg.sni != null && !cfg.sni.isEmpty()) ? cfg.sni : cfg.server;
-        final SSLSocketFactory baseFactory = sslCtx.getSocketFactory();
-
-        // 关键：用底层物理 Network 的 SocketFactory 作为基础
-        // 通过该 factory 创建的 socket 在内核层面直接绑定到物理网卡，天然不走 TUN
-        // 若 network 为 null（权限缺失），降级到 protect() 方案
-        final javax.net.SocketFactory physicalFactory;
-        if (underlyingNetwork != null) {
-            physicalFactory = underlyingNetwork.getSocketFactory();
-            Log.d(TAG, "Using Network.getSocketFactory() - no protect() needed");
-        } else {
-            // 降级方案：用 protect() 逐个保护 socket
-            // 需要 AndroidManifest.xml 声明 ACCESS_NETWORK_STATE 权限才能走上面的主路径
-            Log.w(TAG, "No physical network available, falling back to protect()");
-            final VpnService svc = vpnService;
-            physicalFactory = new javax.net.SocketFactory() {
-                private final javax.net.SocketFactory def = javax.net.SocketFactory.getDefault();
-                private java.net.Socket p(java.net.Socket s) {
-                    if (!svc.protect(s)) Log.e(TAG, "protect(socket) FAILED");
-                    return s;
-                }
-                @Override public java.net.Socket createSocket() throws java.io.IOException { return p(def.createSocket()); }
-                @Override public java.net.Socket createSocket(String h, int port) throws java.io.IOException { return p(def.createSocket(h, port)); }
-                @Override public java.net.Socket createSocket(String h, int port, java.net.InetAddress la, int lp) throws java.io.IOException { return p(def.createSocket(h, port, la, lp)); }
-                @Override public java.net.Socket createSocket(java.net.InetAddress a, int port) throws java.io.IOException { return p(def.createSocket(a, port)); }
-                @Override public java.net.Socket createSocket(java.net.InetAddress a, int port, java.net.InetAddress la, int lp) throws java.io.IOException { return p(def.createSocket(a, port, la, lp)); }
-            };
-        }
-
-        // 包装：在物理 SocketFactory 之上套 SSL + SNI
-        SSLSocketFactory sniPhysicalFactory = new SSLSocketFactory() {
-
-            private SSLSocket upgradeToSsl(Socket plain) throws IOException {
-                SSLSocket ssl = (SSLSocket) baseFactory.createSocket(
-                        plain, sniHost, plain.getPort(), true);
-                SSLParameters p = ssl.getSSLParameters();
-                p.setServerNames(Collections.singletonList(new SNIHostName(sniHost)));
-                ssl.setSSLParameters(p);
-                return ssl;
-            }
-
-            @Override
-            public String[] getDefaultCipherSuites() {
-                return baseFactory.getDefaultCipherSuites();
-            }
-
-            @Override
-            public String[] getSupportedCipherSuites() {
-                return baseFactory.getSupportedCipherSuites();
-            }
-
-            // OkHttp 主要走这个方法：先用物理 factory 建 TCP，再升级 SSL
-            @Override
-            public Socket createSocket(Socket s, String host, int port, boolean autoClose)
-                    throws IOException {
-                // s 是 OkHttp 传入的已连接 socket（由 physicalFactory 创建）
-                // 直接升级到 SSL，SNI 设为我们的 sniHost
-                return upgradeToSsl(s);
-            }
-
-            @Override
-            public Socket createSocket() throws IOException {
-                return physicalFactory.createSocket();
-            }
-
-            @Override
-            public Socket createSocket(String host, int port) throws IOException {
-                return upgradeToSsl(physicalFactory.createSocket(host, port));
-            }
-
-            @Override
-            public Socket createSocket(String host, int port,
-                                       java.net.InetAddress localAddr, int localPort)
-                    throws IOException {
-                return upgradeToSsl(physicalFactory.createSocket(host, port, localAddr, localPort));
-            }
-
-            @Override
-            public Socket createSocket(java.net.InetAddress addr, int port) throws IOException {
-                return upgradeToSsl(physicalFactory.createSocket(addr, port));
-            }
-
-            @Override
-            public Socket createSocket(java.net.InetAddress addr, int port,
-                                       java.net.InetAddress localAddr, int localPort)
-                    throws IOException {
-                return upgradeToSsl(physicalFactory.createSocket(addr, port, localAddr, localPort));
-            }
-        };
-
-        // DNS：通过底层物理 Network 解析，完全不走 TUN
-        Dns physicalDns = underlyingNetwork != null
-                ? new NetworkBoundDns(underlyingNetwork, cfg.server)
-                : Dns.SYSTEM;
-
-        return new OkHttpClient.Builder()
-                .connectTimeout(15, TimeUnit.SECONDS)
-                .readTimeout(60,    TimeUnit.SECONDS)
-                .writeTimeout(60,   TimeUnit.SECONDS)
-                .pingInterval(25,   TimeUnit.SECONDS)
-                .hostnameVerifier((h, s) -> true)
-                .sslSocketFactory(sniPhysicalFactory, trustAll)
-                // socketFactory 用物理网络的，OkHttp 建 TCP 连接时走物理网卡
-                .socketFactory(physicalFactory)
-                .dns(physicalDns)
-                .build();
-    }
-
-    // ── NetworkBoundDns：直接通过物理 Network 解析域名 ───────────────────
-
-    /**
-     * 通过指定的底层物理 Network 做 DNS 解析。
-     * network.getAllByName() 在内核层面走该 Network 绑定的 DNS 服务器，
-     * 不经过 TUN，不需要任何 protect()。
-     */
     private static class NetworkBoundDns implements Dns {
         private final Network network;
         private final String  serverHost;
@@ -460,10 +421,7 @@ public class VlessProxyManager {
 
         @Override
         public List<InetAddress> lookup(String hostname) throws java.net.UnknownHostException {
-            // 对代理服务器域名做缓存，避免每个 WS 连接都解析一次
-            if (serverHost.equals(hostname) && cache != null) {
-                return cache;
-            }
+            if (serverHost.equals(hostname) && cache != null) return cache;
             try {
                 InetAddress[] addrs = network.getAllByName(hostname);
                 List<InetAddress> result = Arrays.asList(addrs);
@@ -474,31 +432,13 @@ public class VlessProxyManager {
                 }
                 return result;
             } catch (Exception e) {
-                Log.w("ProtectedDns", "Network DNS failed for " + hostname
-                        + ": " + e.getMessage() + ", falling back to SYSTEM");
-                // 降级到系统 DNS
+                Log.w("ProtectedDns", "Network DNS failed for " + hostname + ": " + e.getMessage());
                 return Dns.SYSTEM.lookup(hostname);
             }
         }
     }
 
     // ── I/O helpers ───────────────────────────────────────────────────────
-
-    private byte[] collectEarlyData(InputStream in) {
-        try {
-            int avail = in.available();
-            if (avail <= 0) return null;
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            byte[] buf = new byte[65536];
-            while (avail > 0) {
-                int n = in.read(buf, 0, Math.min(avail, buf.length));
-                if (n <= 0) break;
-                baos.write(buf, 0, n);
-                avail = in.available();
-            }
-            return baos.size() > 0 ? baos.toByteArray() : null;
-        } catch (Exception e) { return null; }
-    }
 
     private byte[] readN(InputStream in, int n) throws IOException {
         if (n == 0) return new byte[0];
