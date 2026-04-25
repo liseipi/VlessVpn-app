@@ -1,5 +1,9 @@
 package com.musicses.vlessvpn.app;
 
+import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.VpnService;
 import android.util.Log;
 
@@ -7,11 +11,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.Socket;
-import java.net.UnknownHostException;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.util.Arrays;
@@ -23,7 +24,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
-import javax.net.SocketFactory;
 import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
@@ -43,10 +43,23 @@ import okio.ByteString;
 /**
  * 处理单个 SOCKS5 客户端连接并通过 VLESS WebSocket 转发流量。
  *
- * 关键设计：持有 VlessVpnService（VpnService 子类）引用，
- * 所有 protect() 调用在同一个 VpnService 上下文内执行，完全合法。
+ * ═══════════════════════════════════════════════════════════
+ * 核心修复：彻底废弃 protect(socket)，改用 Network API
+ * ═══════════════════════════════════════════════════════════
  *
- * 原先放在独立 VlessProxyService 里跨 Service 调用 protect() 会静默失败。
+ * 问题根源：
+ *   真机（尤其 MIUI）上 VpnService.protect(socket) 对 OkHttp 创建的
+ *   socket 持续返回 false，导致 WS 连接的 socket 没有被排除在 VPN 之外，
+ *   流量绕回 TUN 接口形成死循环，WS 永远无法建立。
+ *   同时 ProtectedDns 的 UDP DatagramSocket protect 也失败，
+ *   导致 DNS 查询走进 TUN → 超时 → 服务器域名无法解析。
+ *
+ * 解决方案：
+ *   通过 ConnectivityManager 找到底层物理网络（非 VPN 的 Network 对象），
+ *   直接用 network.getSocketFactory() 创建 socket。
+ *   这类 socket 在内核层面直接绑定到物理网卡，天然不走 TUN，
+ *   完全不需要调用 protect()。
+ *   DNS 解析同样通过该 Network 完成，绝不走 TUN。
  */
 public class VlessProxyManager {
     private static final String TAG = "VlessProxy";
@@ -57,6 +70,59 @@ public class VlessProxyManager {
     public VlessProxyManager(VpnService vpnService, VlessConfig cfg) {
         this.vpnService = vpnService;
         this.cfg        = cfg;
+    }
+
+    // ── 获取底层物理 Network ──────────────────────────────────────────────
+
+    /**
+     * 遍历所有 Network，找到有 INTERNET 能力、但不是 VPN 的物理网络。
+     * 优先返回 WIFI，其次 CELLULAR，都没有则返回第一个非 VPN 网络。
+     *
+     * 这是替代 protect() 的核心：用这个 Network 的 SocketFactory 创建的
+     * socket 会直接走物理网卡，不经过 TUN。
+     */
+    private Network getUnderlyingNetwork() {
+        ConnectivityManager cm = (ConnectivityManager)
+                vpnService.getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (cm == null) return null;
+
+        Network wifiNet     = null;
+        Network cellNet     = null;
+        Network fallbackNet = null;
+
+        try {
+            for (Network net : cm.getAllNetworks()) {
+                NetworkCapabilities caps = cm.getNetworkCapabilities(net);
+                if (caps == null) continue;
+                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue;
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue;
+
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    wifiNet = net;
+                } else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                    cellNet = net;
+                } else if (fallbackNet == null) {
+                    fallbackNet = net;
+                }
+            }
+        } catch (SecurityException e) {
+            // ACCESS_NETWORK_STATE 权限缺失，AndroidManifest.xml 里必须声明该权限
+            Log.e(TAG, "Missing ACCESS_NETWORK_STATE permission! " +
+                    "Add <uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\"/> " +
+                    "to AndroidManifest.xml. Error: " + e.getMessage());
+            return null;
+        }
+
+        Network result = wifiNet != null ? wifiNet
+                : cellNet != null ? cellNet
+                : fallbackNet;
+
+        if (result == null) {
+            Log.w(TAG, "No underlying physical network found");
+        } else {
+            Log.d(TAG, "Using underlying network: " + result);
+        }
+        return result;
     }
 
     // ── SOCKS5 入口 ───────────────────────────────────────────────────────
@@ -116,7 +182,9 @@ public class VlessProxyManager {
 
     private void openTunnelAndRelay(Socket sock, InputStream in, OutputStream out,
                                     String destHost, int destPort, byte[] earlyData) {
-        OkHttpClient client = buildClient();
+        // 每次连接都重新获取，确保在网络切换后能自动适应
+        Network underlyingNetwork = getUnderlyingNetwork();
+        OkHttpClient client = buildClient(underlyingNetwork);
         String wsUrl = cfg.buildWsUrl();
 
         Request request = new Request.Builder()
@@ -245,9 +313,11 @@ public class VlessProxyManager {
         Log.d(TAG, "relay ended [" + destHost + ":" + destPort + "]");
     }
 
-    // ── OkHttpClient：ProtectedDns + socketFactory + TLS ─────────────────
+    // ── OkHttpClient：基于 Network API，彻底不用 protect() ───────────────
 
-    private OkHttpClient buildClient() {
+    private OkHttpClient buildClient(Network underlyingNetwork) {
+
+        // Trust-all TLS
         X509TrustManager trustAll = new X509TrustManager() {
             @Override public void checkClientTrusted(X509Certificate[] c, String a) {}
             @Override public void checkServerTrusted(X509Certificate[] c, String a) {}
@@ -262,182 +332,153 @@ public class VlessProxyManager {
             throw new RuntimeException("TLS init failed", e);
         }
 
+        // SNI-aware SSLSocketFactory，基于 underlyingNetwork 的原始 SocketFactory
         final String sniHost = (cfg.sni != null && !cfg.sni.isEmpty()) ? cfg.sni : cfg.server;
-        SSLSocketFactory baseFactory = sslCtx.getSocketFactory();
-        SSLSocketFactory sniFactory = new SSLSocketFactory() {
-            @Override public String[] getDefaultCipherSuites() { return baseFactory.getDefaultCipherSuites(); }
-            @Override public String[] getSupportedCipherSuites() { return baseFactory.getSupportedCipherSuites(); }
-            private Socket withSni(Socket s) {
-                if (s instanceof SSLSocket) {
-                    try {
-                        SSLParameters p = ((SSLSocket) s).getSSLParameters();
-                        p.setServerNames(Collections.singletonList(new SNIHostName(sniHost)));
-                        ((SSLSocket) s).setSSLParameters(p);
-                    } catch (Exception e) { Log.w(TAG, "SNI failed: " + e.getMessage()); }
+        final SSLSocketFactory baseFactory = sslCtx.getSocketFactory();
+
+        // 关键：用底层物理 Network 的 SocketFactory 作为基础
+        // 通过该 factory 创建的 socket 在内核层面直接绑定到物理网卡，天然不走 TUN
+        // 若 network 为 null（权限缺失），降级到 protect() 方案
+        final javax.net.SocketFactory physicalFactory;
+        if (underlyingNetwork != null) {
+            physicalFactory = underlyingNetwork.getSocketFactory();
+            Log.d(TAG, "Using Network.getSocketFactory() - no protect() needed");
+        } else {
+            // 降级方案：用 protect() 逐个保护 socket
+            // 需要 AndroidManifest.xml 声明 ACCESS_NETWORK_STATE 权限才能走上面的主路径
+            Log.w(TAG, "No physical network available, falling back to protect()");
+            final VpnService svc = vpnService;
+            physicalFactory = new javax.net.SocketFactory() {
+                private final javax.net.SocketFactory def = javax.net.SocketFactory.getDefault();
+                private java.net.Socket p(java.net.Socket s) {
+                    if (!svc.protect(s)) Log.e(TAG, "protect(socket) FAILED");
+                    return s;
                 }
-                return s;
+                @Override public java.net.Socket createSocket() throws java.io.IOException { return p(def.createSocket()); }
+                @Override public java.net.Socket createSocket(String h, int port) throws java.io.IOException { return p(def.createSocket(h, port)); }
+                @Override public java.net.Socket createSocket(String h, int port, java.net.InetAddress la, int lp) throws java.io.IOException { return p(def.createSocket(h, port, la, lp)); }
+                @Override public java.net.Socket createSocket(java.net.InetAddress a, int port) throws java.io.IOException { return p(def.createSocket(a, port)); }
+                @Override public java.net.Socket createSocket(java.net.InetAddress a, int port, java.net.InetAddress la, int lp) throws java.io.IOException { return p(def.createSocket(a, port, la, lp)); }
+            };
+        }
+
+        // 包装：在物理 SocketFactory 之上套 SSL + SNI
+        SSLSocketFactory sniPhysicalFactory = new SSLSocketFactory() {
+
+            private SSLSocket upgradeToSsl(Socket plain) throws IOException {
+                SSLSocket ssl = (SSLSocket) baseFactory.createSocket(
+                        plain, sniHost, plain.getPort(), true);
+                SSLParameters p = ssl.getSSLParameters();
+                p.setServerNames(Collections.singletonList(new SNIHostName(sniHost)));
+                ssl.setSSLParameters(p);
+                return ssl;
             }
-            @Override public Socket createSocket() throws IOException { return withSni(baseFactory.createSocket()); }
-            @Override public Socket createSocket(Socket s, String h, int p, boolean ac) throws IOException { return withSni(baseFactory.createSocket(s, sniHost, p, ac)); }
-            @Override public Socket createSocket(String h, int p) throws IOException { return withSni(baseFactory.createSocket(h, p)); }
-            @Override public Socket createSocket(String h, int p, InetAddress la, int lp) throws IOException { return withSni(baseFactory.createSocket(h, p, la, lp)); }
-            @Override public Socket createSocket(InetAddress a, int p) throws IOException { return withSni(baseFactory.createSocket(a, p)); }
-            @Override public Socket createSocket(InetAddress a, int p, InetAddress la, int lp) throws IOException { return withSni(baseFactory.createSocket(a, p, la, lp)); }
+
+            @Override
+            public String[] getDefaultCipherSuites() {
+                return baseFactory.getDefaultCipherSuites();
+            }
+
+            @Override
+            public String[] getSupportedCipherSuites() {
+                return baseFactory.getSupportedCipherSuites();
+            }
+
+            // OkHttp 主要走这个方法：先用物理 factory 建 TCP，再升级 SSL
+            @Override
+            public Socket createSocket(Socket s, String host, int port, boolean autoClose)
+                    throws IOException {
+                // s 是 OkHttp 传入的已连接 socket（由 physicalFactory 创建）
+                // 直接升级到 SSL，SNI 设为我们的 sniHost
+                return upgradeToSsl(s);
+            }
+
+            @Override
+            public Socket createSocket() throws IOException {
+                return physicalFactory.createSocket();
+            }
+
+            @Override
+            public Socket createSocket(String host, int port) throws IOException {
+                return upgradeToSsl(physicalFactory.createSocket(host, port));
+            }
+
+            @Override
+            public Socket createSocket(String host, int port,
+                                       java.net.InetAddress localAddr, int localPort)
+                    throws IOException {
+                return upgradeToSsl(physicalFactory.createSocket(host, port, localAddr, localPort));
+            }
+
+            @Override
+            public Socket createSocket(java.net.InetAddress addr, int port) throws IOException {
+                return upgradeToSsl(physicalFactory.createSocket(addr, port));
+            }
+
+            @Override
+            public Socket createSocket(java.net.InetAddress addr, int port,
+                                       java.net.InetAddress localAddr, int localPort)
+                    throws IOException {
+                return upgradeToSsl(physicalFactory.createSocket(addr, port, localAddr, localPort));
+            }
         };
 
-        // socketFactory：每个 TCP socket 在创建时立即 protect()
-        // vpnService 就是 VlessVpnService 自身，protect() 合法有效
-        final VpnService svc = vpnService;
-        SocketFactory protectedFactory = new SocketFactory() {
-            private final SocketFactory def = SocketFactory.getDefault();
-            private Socket p(Socket s) {
-                if (svc != null && !svc.protect(s))
-                    Log.e(TAG, "protect(socket) FAILED");
-                return s;
-            }
-            @Override public Socket createSocket() throws IOException { return p(def.createSocket()); }
-            @Override public Socket createSocket(String h, int port) throws IOException { return p(def.createSocket(h, port)); }
-            @Override public Socket createSocket(String h, int port, InetAddress la, int lp) throws IOException { return p(def.createSocket(h, port, la, lp)); }
-            @Override public Socket createSocket(InetAddress a, int port) throws IOException { return p(def.createSocket(a, port)); }
-            @Override public Socket createSocket(InetAddress a, int port, InetAddress la, int lp) throws IOException { return p(def.createSocket(a, port, la, lp)); }
-        };
+        // DNS：通过底层物理 Network 解析，完全不走 TUN
+        Dns physicalDns = underlyingNetwork != null
+                ? new NetworkBoundDns(underlyingNetwork, cfg.server)
+                : Dns.SYSTEM;
 
         return new OkHttpClient.Builder()
                 .connectTimeout(15, TimeUnit.SECONDS)
-                .readTimeout(60,  TimeUnit.SECONDS)
-                .writeTimeout(60, TimeUnit.SECONDS)
-                .pingInterval(25, TimeUnit.SECONDS)
+                .readTimeout(60,    TimeUnit.SECONDS)
+                .writeTimeout(60,   TimeUnit.SECONDS)
+                .pingInterval(25,   TimeUnit.SECONDS)
                 .hostnameVerifier((h, s) -> true)
-                .sslSocketFactory(sniFactory, trustAll)
-                .socketFactory(protectedFactory)
-                .dns(new ProtectedDns(cfg.server, vpnService))
+                .sslSocketFactory(sniPhysicalFactory, trustAll)
+                // socketFactory 用物理网络的，OkHttp 建 TCP 连接时走物理网卡
+                .socketFactory(physicalFactory)
+                .dns(physicalDns)
                 .build();
     }
 
-    // ── ProtectedDns ──────────────────────────────────────────────────────
+    // ── NetworkBoundDns：直接通过物理 Network 解析域名 ───────────────────
 
-    private static class ProtectedDns implements Dns {
-        private static final String[] DNS_SERVERS = {"8.8.8.8", "8.8.4.4"};
-        private static final long     TIMEOUT_MS  = 3_000L;
+    /**
+     * 通过指定的底层物理 Network 做 DNS 解析。
+     * network.getAllByName() 在内核层面走该 Network 绑定的 DNS 服务器，
+     * 不经过 TUN，不需要任何 protect()。
+     */
+    private static class NetworkBoundDns implements Dns {
+        private final Network network;
+        private final String  serverHost;
+        private volatile List<InetAddress> cache = null;
 
-        private final String     serverHost;
-        private final VpnService vpnService;
-        private volatile List<InetAddress> sessionCache = null;
-
-        ProtectedDns(String serverHost, VpnService vpnService) {
+        NetworkBoundDns(Network network, String serverHost) {
+            this.network    = network;
             this.serverHost = serverHost;
-            this.vpnService = vpnService;
         }
 
         @Override
-        public List<InetAddress> lookup(String hostname) throws UnknownHostException {
-            if (!serverHost.equals(hostname)) {
-                Log.w("ProtectedDns", "Unexpected host: " + hostname);
+        public List<InetAddress> lookup(String hostname) throws java.net.UnknownHostException {
+            // 对代理服务器域名做缓存，避免每个 WS 连接都解析一次
+            if (serverHost.equals(hostname) && cache != null) {
+                return cache;
+            }
+            try {
+                InetAddress[] addrs = network.getAllByName(hostname);
+                List<InetAddress> result = Arrays.asList(addrs);
+                if (serverHost.equals(hostname)) {
+                    cache = result;
+                    Log.i("ProtectedDns", hostname + " → " + addrs[0].getHostAddress()
+                            + " (via physical network)");
+                }
+                return result;
+            } catch (Exception e) {
+                Log.w("ProtectedDns", "Network DNS failed for " + hostname
+                        + ": " + e.getMessage() + ", falling back to SYSTEM");
+                // 降级到系统 DNS
                 return Dns.SYSTEM.lookup(hostname);
             }
-            if (sessionCache != null) return sessionCache;
-            List<InetAddress> resolved = tryResolveProtected();
-            if (resolved != null && !resolved.isEmpty()) {
-                sessionCache = resolved;
-                Log.i("ProtectedDns", serverHost + " → " + resolved.get(0).getHostAddress());
-                return resolved;
-            }
-            Log.w("ProtectedDns", "Protected DNS failed, falling back to system DNS");
-            List<InetAddress> fallback = Dns.SYSTEM.lookup(hostname);
-            if (!fallback.isEmpty()) { sessionCache = fallback; return fallback; }
-            throw new UnknownHostException("ProtectedDns: cannot resolve " + hostname);
-        }
-
-        private List<InetAddress> tryResolveProtected() {
-            if (vpnService == null) {
-                try { return Dns.SYSTEM.lookup(serverHost); } catch (Exception e) { return null; }
-            }
-            byte[] query = buildDnsQuery(serverHost);
-            AtomicReference<List<InetAddress>> result = new AtomicReference<>(null);
-            CountDownLatch latch = new CountDownLatch(DNS_SERVERS.length);
-            for (String dnsIp : DNS_SERVERS) {
-                Thread t = new Thread(() -> {
-                    try {
-                        DatagramSocket sock = new DatagramSocket();
-                        vpnService.protect(sock); // protect UDP socket，走物理网卡
-                        sock.setSoTimeout((int) TIMEOUT_MS);
-                        try {
-                            InetAddress dest = InetAddress.getByName(dnsIp);
-                            sock.send(new DatagramPacket(query, query.length, dest, 53));
-                            byte[] buf = new byte[512];
-                            DatagramPacket pkt = new DatagramPacket(buf, buf.length);
-                            sock.receive(pkt);
-                            List<InetAddress> addrs = parseDnsARecords(buf, pkt.getLength());
-                            if (!addrs.isEmpty()) result.compareAndSet(null, addrs);
-                        } finally {
-                            try { sock.close(); } catch (Exception ignored) {}
-                        }
-                    } catch (Exception e) {
-                        Log.d("ProtectedDns", "DNS via " + dnsIp + " failed: " + e.getMessage());
-                    } finally {
-                        latch.countDown();
-                    }
-                });
-                t.setDaemon(true);
-                t.start();
-            }
-            try { latch.await(TIMEOUT_MS + 500, TimeUnit.MILLISECONDS); }
-            catch (InterruptedException ignored) {}
-            return result.get();
-        }
-
-        private static byte[] buildDnsQuery(String hostname) {
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            out.write(0x12); out.write(0x34);
-            out.write(0x01); out.write(0x00);
-            out.write(0x00); out.write(0x01);
-            out.write(0x00); out.write(0x00);
-            out.write(0x00); out.write(0x00);
-            out.write(0x00); out.write(0x00);
-            for (String label : hostname.split("\\.")) {
-                out.write(label.length());
-                for (byte b : label.getBytes()) out.write(b);
-            }
-            out.write(0x00);
-            out.write(0x00); out.write(0x01);
-            out.write(0x00); out.write(0x01);
-            return out.toByteArray();
-        }
-
-        private static List<InetAddress> parseDnsARecords(byte[] buf, int len) {
-            List<InetAddress> result = new java.util.ArrayList<>();
-            if (len < 12) return result;
-            int anCount = ((buf[6] & 0xFF) << 8) | (buf[7] & 0xFF);
-            if (anCount == 0) return result;
-            int pos = 12;
-            while (pos < len) {
-                int b = buf[pos] & 0xFF;
-                if ((b & 0xC0) == 0xC0) { pos += 2; break; }
-                if (b == 0) { pos++; break; }
-                pos += b + 1;
-            }
-            pos += 4;
-            for (int i = 0; i < anCount && pos < len; i++) {
-                if ((buf[pos] & 0xC0) == 0xC0) { pos += 2; }
-                else {
-                    while (pos < len) {
-                        int b = buf[pos] & 0xFF;
-                        if ((b & 0xC0) == 0xC0) { pos += 2; break; }
-                        if (b == 0) { pos++; break; }
-                        pos += b + 1;
-                    }
-                }
-                if (pos + 10 > len) break;
-                int type  = ((buf[pos] & 0xFF) << 8) | (buf[pos+1] & 0xFF);
-                int rdLen = ((buf[pos+8] & 0xFF) << 8) | (buf[pos+9] & 0xFF);
-                pos += 10;
-                if (type == 1 && rdLen == 4 && pos + 4 <= len) {
-                    try { result.add(InetAddress.getByAddress(Arrays.copyOfRange(buf, pos, pos + 4))); }
-                    catch (Exception ignored) {}
-                }
-                pos += rdLen;
-            }
-            return result;
         }
     }
 
