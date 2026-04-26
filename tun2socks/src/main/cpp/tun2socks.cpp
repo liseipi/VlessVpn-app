@@ -10,62 +10,78 @@
 static const char *TAG = "tun2socks";
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 根本原因（精确定位）：
+// 修复方案说明：
 //
-// badvpn tun2socks_start() 内部有多个全局状态变量（均为 static int）：
-//   - blog_initialized    (BLog.c)
-//   - bsignal_initialized (BSignal.c)
-//   - quitting            (tun2socks.c)
-//   以及 BReactor 实例 ss（可能是静态局部变量）
+// 问题：badvpn 内部有多个 static 全局变量，tun2socks_start() 退出后无法重置：
+//   - blog_initialized    (base/BLog.c)
+//   - bsignal_initialized (system/BSignal.c)
+//   - bsignal_sigfd       (system/BSignal.c)
+//   - quitting            (tun2socks/tun2socks.c) ← 已是全局，可被 dlsym 找到
 //
-// 正常退出时，tun2socks_start() 会按 fail-chain 顺序清理这些状态。
-// 但当 tun2socks_terminate() 被外部调用时，退出路径可能因为
-// 各子系统的清理竞态，导致某个全局变量没有被正确归零。
+// badvpn 源码修改（必须重新编译 .a 文件）：
+//   base/BLog.c:    static int blog_initialized = 0;
+//                → int blog_initialized = 0;
+//   system/BSignal.c: static int bsignal_initialized = 0;
+//                   → int bsignal_initialized = 0;
+//                     static int bsignal_sigfd = -1;
+//                   → int bsignal_sigfd = -1;
 //
-// 症状：第三次 tun2socks_start() 调用后完全静默退出，连 stdout 第一行都没有。
-// 原因：blog_initialized 仍为 1，BLog_InitStdout() 内部触发 ASSERT 或
-//       在 NDEBUG 模式下直接 return，导致后续的所有输出通道未建立就退出。
-//
-// 修复：用 dlsym 找到所有已知全局状态变量，在每次 start 前强制重置。
-//       这是比 fork() 更简洁且 Android 兼容的方案。
+// 修改后重新编译 libtun2socks.a，这些符号就会被导出，dlsym 可以找到它们。
 // ══════════════════════════════════════════════════════════════════════════════
 
 static void reset_badvpn_globals() {
-    struct { const char *name; const char *desc; } symbols[] = {
-            {"tun2socks_should_terminate", "tun2socks_should_terminate"},
-            {"quitting",                   "quitting"},
-            {"blog_initialized",           "blog_initialized"},
-            {"bsignal_initialized",        "bsignal_initialized"},
-    };
+    // 按 tun2socks_start() 的初始化顺序逆序重置，确保安全
 
-    for (auto &s : symbols) {
-        void *sym = dlsym(RTLD_DEFAULT, s.name);
+    // 1. 重置 quitting（tun2socks.c，通常已经是全局导出）
+    const char *quit_names[] = {"tun2socks_should_terminate", "quitting", nullptr};
+    for (int i = 0; quit_names[i]; i++) {
+        void *sym = dlsym(RTLD_DEFAULT, quit_names[i]);
         if (sym) {
-            int old_val = *reinterpret_cast<int*>(sym);
+            int old = *reinterpret_cast<int*>(sym);
             *reinterpret_cast<int*>(sym) = 0;
-            __android_log_print(ANDROID_LOG_INFO, TAG,
-                                "reset %s: %d -> 0", s.desc, old_val);
+            __android_log_print(ANDROID_LOG_INFO, TAG, "reset %s: %d -> 0", quit_names[i], old);
+            break;
         }
     }
 
-    // bsignal 持有一个 signalfd，重置前需要先关闭它
-    // bsignal 全局结构：{ int initialized; int sigfd; BReactor* reactor; ... }
-    // 我们通过查找 bsignal_fd 或 bsignal_sigfd 符号来获取它
-    const char *sigfd_names[] = {
-            "bsignal_sigfd", "bsignal_fd", "signal_fd", nullptr
-    };
+    // 2. 关闭并重置 bsignal_sigfd（避免 fd 泄漏）
+    const char *sigfd_names[] = {"bsignal_sigfd", "bsignal_fd", nullptr};
     for (int i = 0; sigfd_names[i]; i++) {
         void *sym = dlsym(RTLD_DEFAULT, sigfd_names[i]);
         if (sym) {
             int fd = *reinterpret_cast<int*>(sym);
-            if (fd > 2) {  // 排除 stdin/stdout/stderr
+            if (fd > 2) {
                 close(fd);
-                *reinterpret_cast<int*>(sym) = -1;
                 __android_log_print(ANDROID_LOG_INFO, TAG,
-                                    "closed and reset %s (fd=%d)", sigfd_names[i], fd);
+                                    "closed %s fd=%d", sigfd_names[i], fd);
             }
+            *reinterpret_cast<int*>(sym) = -1;
             break;
         }
+    }
+
+    // 3. 重置 bsignal_initialized
+    void *sym = dlsym(RTLD_DEFAULT, "bsignal_initialized");
+    if (sym) {
+        int old = *reinterpret_cast<int*>(sym);
+        *reinterpret_cast<int*>(sym) = 0;
+        __android_log_print(ANDROID_LOG_INFO, TAG, "reset bsignal_initialized: %d -> 0", old);
+    } else {
+        __android_log_write(ANDROID_LOG_WARN, TAG,
+                            "bsignal_initialized NOT FOUND via dlsym. "
+                            "Recompile badvpn: remove 'static' from bsignal_initialized in BSignal.c");
+    }
+
+    // 4. 重置 blog_initialized（最重要！这是导致静默退出的根本原因）
+    sym = dlsym(RTLD_DEFAULT, "blog_initialized");
+    if (sym) {
+        int old = *reinterpret_cast<int*>(sym);
+        *reinterpret_cast<int*>(sym) = 0;
+        __android_log_print(ANDROID_LOG_INFO, TAG, "reset blog_initialized: %d -> 0", old);
+    } else {
+        __android_log_write(ANDROID_LOG_WARN, TAG,
+                            "blog_initialized NOT FOUND via dlsym. "
+                            "Recompile badvpn: remove 'static' from blog_initialized in BLog.c");
     }
 }
 
@@ -112,12 +128,12 @@ extern "C"
 JNIEXPORT jint JNICALL
 Java_com_musicses_vlessvpn_Tun2Socks_start_1tun2socks(JNIEnv *env, jclass clazz,
                                                       jobjectArray args) {
-    // 每次启动前重置所有 badvpn 全局状态
     reset_badvpn_globals();
 
     jsize argument_count = env->GetArrayLength(args);
     char **argv = (char **) calloc(argument_count + 1, sizeof(char *));
     if (!argv) { __android_log_write(ANDROID_LOG_ERROR, TAG, "OOM"); return -1; }
+
     for (jsize i = 0; i < argument_count; i++) {
         jstring jstr = (jstring) env->GetObjectArrayElement(args, i);
         const char *cstr = env->GetStringUTFChars(jstr, nullptr);
@@ -130,8 +146,7 @@ Java_com_musicses_vlessvpn_Tun2Socks_start_1tun2socks(JNIEnv *env, jclass clazz,
 
     __android_log_write(ANDROID_LOG_INFO, TAG, "calling tun2socks_start()");
     int result = tun2socks_start((int) argument_count, argv);
-    __android_log_print(ANDROID_LOG_INFO, TAG,
-                        "tun2socks_start() returned %d", result);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "tun2socks_start() returned %d", result);
 
     for (jsize i = 0; i < argument_count; i++) free(argv[i]);
     free(argv);

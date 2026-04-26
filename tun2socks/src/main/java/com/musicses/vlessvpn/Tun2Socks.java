@@ -1,7 +1,6 @@
 package com.musicses.vlessvpn;
 
 import android.content.Context;
-import android.net.VpnService;
 import android.os.ParcelFileDescriptor;
 import android.text.TextUtils;
 import android.util.Log;
@@ -16,29 +15,28 @@ import java.util.Locale;
 public class Tun2Socks {
 
     private static final String TAG = "tun2socks";
-    private static volatile boolean isInitialized = false;
 
-    /**
-     * 加载 native 库（只加载一次，进程级别）。
-     * System.loadLibrary 本身是幂等的，这里的 isInitialized 仅作为快速返回。
-     */
-    public static void initialize(Context context) {
-        if (isInitialized) {
-            Log.w(TAG, "initialization before done");
-            return;
-        }
+    // System.loadLibrary 本身是幂等的（同一 ClassLoader 下只加载一次）
+    // 用 static initializer 加载，避免任何时序问题
+    static {
         System.loadLibrary("tun2socks");
-        isInitialized = true;
     }
 
     /**
-     * 启动 tun2socks（阻塞，需在独立线程中调用）。
+     * 初始化（现在只是一个可选的显式调用点，实际加载由 static block 完成）。
+     * 保留此方法以兼容现有调用代码，不再有任何副作用。
+     */
+    public static void initialize(Context context) {
+        // 无需操作：static block 已完成库加载
+        // 之前的 isInitialized 标志会导致第二次调用 initialize() 时打印
+        // "initialization before done" 警告，这会误导调试
+        Log.d(TAG, "initialize() called (library already loaded via static block)");
+    }
+
+    /**
+     * 启动 tun2socks（阻塞，须在独立线程中调用）。
      *
-     * 修复重连问题：
-     *   badvpn 内部有一个全局终止标志，tun2socks_terminate() 设置它，
-     *   tun2socks_start() 检查它——若已设置则立即返回，导致第二次连接失败。
-     *   native 层的 reset_tun2socks_terminate_flag() 会在每次 start 前用
-     *   dlsym 找到该标志并归零。若找不到（变量是 static），会打印 WARNING。
+     * @return true 表示正常退出（exitCode == 0），false 表示异常退出
      */
     public static boolean startTun2Socks(
             LogLevel logLevel,
@@ -81,17 +79,12 @@ public class Tun2Socks {
 
     // ── Native 方法 ───────────────────────────────────────────────────────
 
-    /**
-     * 启动 tun2socks（阻塞）。
-     * native 层在调用 tun2socks_start() 前会先调用 reset_tun2socks_terminate_flag()
-     * 以确保重连可以正常工作。
-     */
     private static native int start_tun2socks(String[] args);
 
-    /** 停止 tun2socks。 */
     public static native void stopTun2Socks();
 
     public static native void printTun2SocksHelp();
+
     public static native void printTun2SocksVersion();
 
     // ── LogLevel ─────────────────────────────────────────────────────────
